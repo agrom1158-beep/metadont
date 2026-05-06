@@ -13,6 +13,7 @@ with open("config.json", "r", encoding="utf-8") as f:
 
 # Константы для дизайна
 INVISIBLE_COLOR = 0x2B2D31
+SKY_BLUE = 0x87CEEB  # «небесно-голубой» акцент Container'а панели заявок
 
 # Persistent custom ids
 APPLICATION_SELECT_CID = "application_action_select"
@@ -76,7 +77,7 @@ def build_application_panel() -> list[disnake.ui.Container]:
 
     children.append(
         disnake.ui.Separator(
-            divider=False, spacing=disnake.SeparatorSpacing.small
+            divider=True, spacing=disnake.SeparatorSpacing.small
         )
     )
     children.append(
@@ -87,7 +88,7 @@ def build_application_panel() -> list[disnake.ui.Container]:
 
     children.append(
         disnake.ui.Separator(
-            divider=False, spacing=disnake.SeparatorSpacing.small
+            divider=True, spacing=disnake.SeparatorSpacing.small
         )
     )
     children.append(
@@ -100,7 +101,7 @@ def build_application_panel() -> list[disnake.ui.Container]:
 
     children.append(
         disnake.ui.Separator(
-            divider=False, spacing=disnake.SeparatorSpacing.small
+            divider=True, spacing=disnake.SeparatorSpacing.small
         )
     )
     children.append(
@@ -111,7 +112,7 @@ def build_application_panel() -> list[disnake.ui.Container]:
 
     children.append(
         disnake.ui.Separator(
-            divider=False, spacing=disnake.SeparatorSpacing.small
+            divider=True, spacing=disnake.SeparatorSpacing.small
         )
     )
     children.append(disnake.ui.TextDisplay("**Подать заявку:**"))
@@ -132,7 +133,11 @@ def build_application_panel() -> list[disnake.ui.Container]:
     )
     children.append(disnake.ui.ActionRow(select))
 
-    return [disnake.ui.Container(*children)]
+    return [
+        disnake.ui.Container(
+            *children, accent_colour=disnake.Colour(SKY_BLUE)
+        )
+    ]
 
 
 # ==========================================
