@@ -47,14 +47,23 @@ EVENT_EMOJIS = {
 }
 STATS_EMOJI = "<:skull_emoji:1490574119077412894>"
 
-# Эмодзи тиров слева от участника в списке сбора
-TIER_EMOJI_KEYS = {1: "TIER1", 2: "TIER2", 3: "TIER3", 9: "TIER_NONE"}
+# КАСТОМНЫЕ СМАЙЛИКИ ТИРОВ (слева от участника в списке сбора)
+# Подставь ID своих эмодзи на сервере: <:имя:ID>
+TIER_EMOJIS = {
+    1: "<:tier1:0000000000000000000>",       # S — Tier 1
+    2: "<:tier2:0000000000000000000>",       # A — Tier 2
+    3: "<:tier3:0000000000000000000>",       # B — Tier 3
+    9: "<:tier_none:0000000000000000000>",   # — без тира
+}
+# Unicode-fallback на случай, если ID ещё не подставлены
 TIER_EMOJI_FALLBACK = {1: "\U0001F7E1", 2: "\U0001F534", 3: "\U0001F535", 9: "\u2B1C"}
 
 def _tier_emoji(tier_num: int) -> str:
-    key = TIER_EMOJI_KEYS.get(tier_num, "TIER_NONE")
-    val = _cfg.get("EMOJIS", {}).get(key, "")
-    return val if val else TIER_EMOJI_FALLBACK.get(tier_num, TIER_EMOJI_FALLBACK[9])
+    val = TIER_EMOJIS.get(tier_num, TIER_EMOJIS[9])
+    # Если ID ещё дефолтный (нули) — отдадим Unicode-фолбэк
+    if "0000000000000000000" in val:
+        return TIER_EMOJI_FALLBACK.get(tier_num, TIER_EMOJI_FALLBACK[9])
+    return val
 
 # ==========================================
 
