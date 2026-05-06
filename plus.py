@@ -501,6 +501,34 @@ class PlusEventView(disnake.ui.View):
             lines.append(f"> … + ещё {rest} участн.")
         return "\n".join(lines)
 
+    async def _participants_chunks(self, guild: disnake.Guild, *, field_max: int = 1024) -> list[str]:
+        """Возвращает список участников, разбитый на чанки <= field_max символов
+        (Discord embed field value limit), чтобы 35 строк гарантированно помещались
+        даже с длинными кастомными эмодзи и mention-ами."""
+        if not self.state.members:
+            return []
+        lines = await self._participants_lines(guild)
+        if len(lines) > config.PLUS_PARTICIPANTS_MAX_LINES:
+            rest = len(lines) - config.PLUS_PARTICIPANTS_MAX_LINES
+            lines = lines[:config.PLUS_PARTICIPANTS_MAX_LINES]
+            lines.append(f"> … + ещё {rest} участн.")
+
+        chunks: list[str] = []
+        current: list[str] = []
+        current_len = 0
+        for line in lines:
+            extra = len(line) + (1 if current else 0)  # +1 для \n
+            if current and current_len + extra > field_max:
+                chunks.append("\n".join(current))
+                current = [line]
+                current_len = len(line)
+            else:
+                current.append(line)
+                current_len += extra
+        if current:
+            chunks.append("\n".join(current))
+        return chunks
+
     async def _participants_lines(self, guild: disnake.Guild) -> list[str]:
         if not self.state.members: return []
         enriched = []
@@ -524,11 +552,17 @@ class PlusEventView(disnake.ui.View):
         # Получаем кастомный эмодзи для заголовка
         ev_emoji = EVENT_EMOJIS.get(self.state.event_type, e('PLUS'))
         emb = brand_embed(title=f"{ev_emoji} PLUS | {self.state.event_type}", description=desc)
-        emb.add_field(
-            name=f"Участники: {e('PEOPLE')}{self.state.used}/{self.state.total_slots}",
-            value=await self._participants_text(guild),
-            inline=False,
-        )
+
+        # Список участников — с учётом лимита Discord 1024 симв./поле,
+        # длинный список бьём на несколько полей, чтобы все 35 строк помещались.
+        participants_field_name = f"Участники: {e('PEOPLE')}{self.state.used}/{self.state.total_slots}"
+        chunks = await self._participants_chunks(guild)
+        if not chunks:
+            emb.add_field(name=participants_field_name, value="> —", inline=False)
+        else:
+            emb.add_field(name=participants_field_name, value=chunks[0], inline=False)
+            for extra in chunks[1:]:
+                emb.add_field(name="\u200b", value=extra, inline=False)
         
         if self.state.logs_enabled and self.state.logs_thread_id: 
             emb.add_field(name=f"{e('RECEIPT')}Ветка сбора", value=f"<#{self.state.logs_thread_id}>", inline=False)
