@@ -340,6 +340,7 @@ class PlusState:
     warned: bool = False  
     members: list[int] = field(default_factory=list)
     pending_members: list[int] = field(default_factory=list)
+    ping_message_id: int = 0
 
     @property
     def total_slots(self) -> int: return self.base_slots + self.extra_slots
@@ -351,8 +352,8 @@ class PlusState:
 async def save_plus_state(message_id: int, channel_id: int, state: PlusState):
     async with aiosqlite.connect("data/database.sqlite") as db:
         await db.execute(
-            "INSERT OR REPLACE INTO active_plus_events (message_id, channel_id, event_type, ts, base_slots, extra_slots, closed, members, revealed, warned, logs_enabled, logs_thread_id, image_url, pending_members) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (str(message_id), str(channel_id), state.event_type, state.ts, state.base_slots, state.extra_slots, int(state.closed), json.dumps(state.members), int(state.revealed), int(state.warned), int(state.logs_enabled), str(state.logs_thread_id), state.image_url, json.dumps(state.pending_members))
+            "INSERT OR REPLACE INTO active_plus_events (message_id, channel_id, event_type, ts, base_slots, extra_slots, closed, members, revealed, warned, logs_enabled, logs_thread_id, image_url, pending_members, ping_message_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (str(message_id), str(channel_id), state.event_type, state.ts, state.base_slots, state.extra_slots, int(state.closed), json.dumps(state.members), int(state.revealed), int(state.warned), int(state.logs_enabled), str(state.logs_thread_id), state.image_url, json.dumps(state.pending_members), str(state.ping_message_id))
         )
         await db.commit()
 
@@ -371,15 +372,14 @@ class PlusEventView(disnake.ui.View):
         
         current_ts = datetime.now(timezone.utc).timestamp()
         
-        # Кнопки взаимодействия вынесены из селекта в первый ряд
-        if current_ts < self.state.ts and not self.state.revealed:
-            join_btn = disnake.ui.Button(label="Присоединиться", style=disnake.ButtonStyle.success, custom_id="plus_join", emoji=e_btn("JOIN"), row=0)
-            join_btn.callback = self.join_callback
-            self.add_item(join_btn)
+        # Кнопки Join/Leave всегда доступны и не зависят от времени сбора
+        join_btn = disnake.ui.Button(label="Присоединиться", style=disnake.ButtonStyle.success, custom_id="plus_join", emoji=e_btn("JOIN"), row=0)
+        join_btn.callback = self.join_callback
+        self.add_item(join_btn)
 
-            leave_btn = disnake.ui.Button(label="Покинуть", style=disnake.ButtonStyle.danger, custom_id="plus_leave", emoji=e_btn("LEAVE"), row=0)
-            leave_btn.callback = self.leave_callback
-            self.add_item(leave_btn)
+        leave_btn = disnake.ui.Button(label="Покинуть", style=disnake.ButtonStyle.danger, custom_id="plus_leave", emoji=e_btn("LEAVE"), row=0)
+        leave_btn.callback = self.leave_callback
+        self.add_item(leave_btn)
 
         options = []
         if current_ts < self.state.ts and not self.state.revealed:
@@ -405,7 +405,7 @@ class PlusEventView(disnake.ui.View):
         await inter.response.defer(ephemeral=True)
         self.message = inter.message
                 
-        if self.state.closed or self.state.revealed: 
+        if self.state.closed: 
             return await inter.followup.send(f"{e('REJECT')}Сбор закрыт.", ephemeral=True)
         if inter.user.id in self.state.members: 
             return await inter.followup.send(f"{e('WARNING')}Ты уже в списке участников.", ephemeral=True)
@@ -540,9 +540,9 @@ class PlusEventView(disnake.ui.View):
         if not self.message: return
         for child in self.children:
             if getattr(child, "custom_id", "") == "plus_join":
-                child.disabled = self.state.closed or self.state.is_full or self.state.revealed
+                child.disabled = self.state.closed or self.state.is_full
             if getattr(child, "custom_id", "") == "plus_leave":
-                child.disabled = self.state.closed or self.state.revealed
+                child.disabled = self.state.closed
 
         try: 
             embed = await self.build_embed(guild)
@@ -562,13 +562,26 @@ class PlusEventView(disnake.ui.View):
             try: await thread.send(text)
             except disnake.HTTPException: pass
 
-    async def ping_main_role(self, channel: disnake.abc.Messageable):
+    async def ping_main_role(self, channel: disnake.abc.Messageable) -> int:
         roles_to_ping = [1183854185586901063, 1183863207576739931, 1322890140913369178]
         mentions = " ".join([f"<@&{r_id}>" for r_id in roles_to_ping])
         try: 
-            await channel.send(f"{mentions} - плюса на {self.state.event_type}")
+            ping_msg = await channel.send(f"{mentions} - плюса на {self.state.event_type}")
+            self.state.ping_message_id = ping_msg.id
+            return ping_msg.id
         except disnake.HTTPException: 
+            return 0
+
+    async def delete_role_ping(self):
+        if not self.state.ping_message_id or not self.message:
+            return
+        try:
+            channel = self.message.channel
+            ping_msg = await channel.fetch_message(int(self.state.ping_message_id))
+            await ping_msg.delete()
+        except Exception:
             pass
+        self.state.ping_message_id = 0
 
     async def notify_participants_dm(self, guild: disnake.Guild, actor_id: int):
         target_members = set()
@@ -667,6 +680,9 @@ class PlusEventView(disnake.ui.View):
         await self.log_to_thread(f"{e('FINISH')}PLUS завершён ({res_text}): тип={self.state.event_type}, участников={self.state.used}/{self.state.total_slots} (админ: <@{actor_id}>)")
         
         self.state.closed = True
+        
+        # Удаляем пинг ролей перед удалением эмбеда
+        await self.delete_role_ping()
         
         if self.message:
             await delete_plus_state(self.message.id)
@@ -864,7 +880,8 @@ class PlusCog(commands.Cog):
                 logs_enabled INTEGER DEFAULT 0,
                 logs_thread_id TEXT DEFAULT '0',
                 image_url TEXT DEFAULT '',
-                pending_members TEXT DEFAULT '[]'
+                pending_members TEXT DEFAULT '[]',
+                ping_message_id TEXT DEFAULT '0'
             )""")
             
             # ТАБЛИЦЫ ДЛЯ BAN CAPT
@@ -883,13 +900,15 @@ class PlusCog(commands.Cog):
             except Exception: pass
             try: await db.execute("ALTER TABLE active_plus_events ADD COLUMN pending_members TEXT DEFAULT '[]'")
             except Exception: pass
+            try: await db.execute("ALTER TABLE active_plus_events ADD COLUMN ping_message_id TEXT DEFAULT '0'")
+            except Exception: pass
             await db.commit()
             
-            async with db.execute("SELECT message_id, channel_id, event_type, ts, base_slots, extra_slots, closed, members, revealed, warned, logs_enabled, logs_thread_id, image_url, pending_members FROM active_plus_events") as cursor:
+            async with db.execute("SELECT message_id, channel_id, event_type, ts, base_slots, extra_slots, closed, members, revealed, warned, logs_enabled, logs_thread_id, image_url, pending_members, ping_message_id FROM active_plus_events") as cursor:
                 rows = await cursor.fetchall()
                 
             for row in rows:
-                message_id, channel_id, event_type, ts, base_slots, extra_slots, closed, members_json, revealed, warned, logs_enabled, logs_thread_id, image_url, pending_json = row
+                message_id, channel_id, event_type, ts, base_slots, extra_slots, closed, members_json, revealed, warned, logs_enabled, logs_thread_id, image_url, pending_json, ping_message_id = row
                 try: members = json.loads(members_json)
                 except: members = []
                 try: pending_members = json.loads(pending_json)
@@ -898,7 +917,8 @@ class PlusCog(commands.Cog):
                 state = PlusState(
                     event_type=event_type, ts=ts, base_slots=base_slots, extra_slots=extra_slots,
                     closed=bool(closed), members=members, revealed=bool(revealed), warned=bool(warned),
-                    logs_enabled=bool(logs_enabled), logs_thread_id=int(logs_thread_id), image_url=image_url or "", pending_members=pending_members
+                    logs_enabled=bool(logs_enabled), logs_thread_id=int(logs_thread_id), image_url=image_url or "", pending_members=pending_members,
+                    ping_message_id=int(ping_message_id or 0)
                 )
                 
                 view = PlusEventView(self.bot, state)
@@ -926,12 +946,12 @@ class PlusCog(commands.Cog):
         # Блокировка от конфликтов базы данных
         async with _PLUS_ACTION_LOCK:
             async with aiosqlite.connect("data/database.sqlite") as db:
-                async with db.execute("SELECT message_id, channel_id, event_type, ts, base_slots, extra_slots, closed, members, revealed, warned, logs_enabled, logs_thread_id, image_url, pending_members FROM active_plus_events WHERE logs_thread_id = ?", (str(payload.channel_id),)) as cursor:
+                async with db.execute("SELECT message_id, channel_id, event_type, ts, base_slots, extra_slots, closed, members, revealed, warned, logs_enabled, logs_thread_id, image_url, pending_members, ping_message_id FROM active_plus_events WHERE logs_thread_id = ?", (str(payload.channel_id),)) as cursor:
                     row = await cursor.fetchone()
                     
             if not row: return
             
-            message_id, channel_id, event_type, ts, base_slots, extra_slots, closed, members_json, revealed, warned, logs_enabled, logs_thread_id, image_url, pending_json = row
+            message_id, channel_id, event_type, ts, base_slots, extra_slots, closed, members_json, revealed, warned, logs_enabled, logs_thread_id, image_url, pending_json, ping_message_id = row
             
             if closed or revealed: return
             
@@ -968,7 +988,8 @@ class PlusCog(commands.Cog):
             state = PlusState(
                 event_type=event_type, ts=ts, base_slots=base_slots, extra_slots=extra_slots,
                 closed=bool(closed), members=members, revealed=bool(revealed), warned=bool(warned),
-                logs_enabled=bool(logs_enabled), logs_thread_id=int(logs_thread_id), image_url=image_url or "", pending_members=pending_members
+                logs_enabled=bool(logs_enabled), logs_thread_id=int(logs_thread_id), image_url=image_url or "", pending_members=pending_members,
+                ping_message_id=int(ping_message_id or 0)
             )
             
             await save_plus_state(message_id, channel_id, state)
@@ -1002,12 +1023,12 @@ class PlusCog(commands.Cog):
         # Блокировка от конфликтов базы данных
         async with _PLUS_ACTION_LOCK:
             async with aiosqlite.connect("data/database.sqlite") as db:
-                async with db.execute("SELECT message_id, channel_id, event_type, ts, base_slots, extra_slots, closed, members, revealed, warned, logs_enabled, logs_thread_id, image_url, pending_members FROM active_plus_events WHERE logs_thread_id = ?", (str(payload.channel_id),)) as cursor:
+                async with db.execute("SELECT message_id, channel_id, event_type, ts, base_slots, extra_slots, closed, members, revealed, warned, logs_enabled, logs_thread_id, image_url, pending_members, ping_message_id FROM active_plus_events WHERE logs_thread_id = ?", (str(payload.channel_id),)) as cursor:
                     row = await cursor.fetchone()
                     
             if not row: return
             
-            message_id, channel_id, event_type, ts, base_slots, extra_slots, closed, members_json, revealed, warned, logs_enabled, logs_thread_id, image_url, pending_json = row
+            message_id, channel_id, event_type, ts, base_slots, extra_slots, closed, members_json, revealed, warned, logs_enabled, logs_thread_id, image_url, pending_json, ping_message_id = row
             
             if closed or revealed: return
             
@@ -1040,7 +1061,8 @@ class PlusCog(commands.Cog):
             state = PlusState(
                 event_type=event_type, ts=ts, base_slots=base_slots, extra_slots=extra_slots,
                 closed=bool(closed), members=members, revealed=bool(revealed), warned=bool(warned),
-                logs_enabled=bool(logs_enabled), logs_thread_id=int(logs_thread_id), image_url=image_url or "", pending_members=pending_members
+                logs_enabled=bool(logs_enabled), logs_thread_id=int(logs_thread_id), image_url=image_url or "", pending_members=pending_members,
+                ping_message_id=int(ping_message_id or 0)
             )
             
             await save_plus_state(message_id, channel_id, state)
@@ -1054,6 +1076,37 @@ class PlusCog(commands.Cog):
                     embed = await view.build_embed(guild)
                     await main_msg.edit(embed=embed, view=view)
                 except Exception: pass
+
+    # ==========================================
+    # УДАЛЕНИЕ ПИНГА РОЛЕЙ ПРИ РУЧНОМ УДАЛЕНИИ ЭМБЕДА
+    # ==========================================
+    @commands.Cog.listener()
+    async def on_raw_message_delete(self, payload: disnake.RawMessageDeleteEvent):
+        async with aiosqlite.connect("data/database.sqlite") as db:
+            async with db.execute(
+                "SELECT channel_id, ping_message_id FROM active_plus_events WHERE message_id = ?",
+                (str(payload.message_id),),
+            ) as cursor:
+                row = await cursor.fetchone()
+            if not row:
+                return
+            channel_id, ping_message_id = row
+            await db.execute(
+                "DELETE FROM active_plus_events WHERE message_id = ?",
+                (str(payload.message_id),),
+            )
+            await db.commit()
+
+        if not ping_message_id or str(ping_message_id) in ("0", ""):
+            return
+        channel = self.bot.get_channel(int(channel_id))
+        if not channel:
+            return
+        try:
+            ping_msg = await channel.fetch_message(int(ping_message_id))
+            await ping_msg.delete()
+        except Exception:
+            pass
 
     @tasks.loop(minutes=1)
     async def auto_update_loop(self):
@@ -1071,11 +1124,11 @@ class PlusCog(commands.Cog):
         # 3. ОБНОВЛЕНИЕ АКТИВНЫХ СБОРОВ
         now = datetime.now(timezone.utc).timestamp()
         async with aiosqlite.connect("data/database.sqlite") as db:
-            async with db.execute("SELECT message_id, channel_id, event_type, ts, base_slots, extra_slots, closed, members, revealed, warned, logs_enabled, logs_thread_id, image_url, pending_members FROM active_plus_events WHERE revealed = 0 OR warned = 0") as cursor:
+            async with db.execute("SELECT message_id, channel_id, event_type, ts, base_slots, extra_slots, closed, members, revealed, warned, logs_enabled, logs_thread_id, image_url, pending_members, ping_message_id FROM active_plus_events WHERE revealed = 0 OR warned = 0") as cursor:
                 rows = await cursor.fetchall()
                 
             for row in rows:
-                message_id, channel_id, event_type, ts, base_slots, extra_slots, closed, members_json, revealed, warned, logs_enabled, logs_thread_id, image_url, pending_json = row
+                message_id, channel_id, event_type, ts, base_slots, extra_slots, closed, members_json, revealed, warned, logs_enabled, logs_thread_id, image_url, pending_json, ping_message_id = row
                 
                 channel = self.bot.get_channel(int(channel_id))
                 if not channel: continue
@@ -1089,7 +1142,8 @@ class PlusCog(commands.Cog):
                     
                     state = PlusState(
                         event_type, ts, base_slots, extra_slots, bool(closed), members=members, 
-                        revealed=bool(revealed), warned=bool(warned), logs_enabled=bool(logs_enabled), logs_thread_id=int(logs_thread_id), image_url=image_url or "", pending_members=pending_members
+                        revealed=bool(revealed), warned=bool(warned), logs_enabled=bool(logs_enabled), logs_thread_id=int(logs_thread_id), image_url=image_url or "", pending_members=pending_members,
+                        ping_message_id=int(ping_message_id or 0)
                     )
                     
                     changed = False
