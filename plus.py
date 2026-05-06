@@ -47,6 +47,15 @@ EVENT_EMOJIS = {
 }
 STATS_EMOJI = "<:skull_emoji:1490574119077412894>"
 
+# Эмодзи тиров слева от участника в списке сбора
+TIER_EMOJI_KEYS = {1: "TIER1", 2: "TIER2", 3: "TIER3", 9: "TIER_NONE"}
+TIER_EMOJI_FALLBACK = {1: "\U0001F7E1", 2: "\U0001F534", 3: "\U0001F535", 9: "\u2B1C"}
+
+def _tier_emoji(tier_num: int) -> str:
+    key = TIER_EMOJI_KEYS.get(tier_num, "TIER_NONE")
+    val = _cfg.get("EMOJIS", {}).get(key, "")
+    return val if val else TIER_EMOJI_FALLBACK.get(tier_num, TIER_EMOJI_FALLBACK[9])
+
 # ==========================================
 
 def get_safe_url(url: str) -> str:
@@ -62,7 +71,7 @@ class PlusConfig:
     PLUS_TIER3_ROLE_ID = _cfg["PLUS"]["TIER3_ROLE"]
     
     PLUS_SETTINGS_ROLE_IDS = _cfg["PLUS"]["SETTINGS_ROLES"]
-    PLUS_PARTICIPANTS_MAX_LINES = _cfg["PLUS"]["PARTICIPANTS_MAX_LINES"]
+    PLUS_PARTICIPANTS_MAX_LINES = 35  # Лимит отображаемых участников в эмбеде сбора
     PLUS_PARTICIPANTS_PAGE_SIZE = _cfg["PLUS"]["PARTICIPANTS_PAGE_SIZE"]
     PLUS_DM_MAX_RECIPIENTS = _cfg["PLUS"]["DM_MAX_RECIPIENTS"]
     
@@ -490,7 +499,7 @@ class PlusEventView(disnake.ui.View):
             tier_num, tier_label = await self._get_tier(guild, uid)
             enriched.append((tier_num, idx, uid, tier_label))
         enriched.sort(key=lambda x: (x[0], x[1]))
-        return [f"> `{i:02d}.` <@{uid}> — {tier_label}" for i, (_, _, uid, tier_label) in enumerate(enriched, start=1)]
+        return [f"> `{i:02d}.` {_tier_emoji(tier_num)} <@{uid}>" for i, (tier_num, _, uid, _) in enumerate(enriched, start=1)]
 
     async def build_embed(self, guild: disnake.Guild) -> disnake.Embed:
         current_ts = datetime.now(timezone.utc).timestamp()
@@ -501,16 +510,16 @@ class PlusEventView(disnake.ui.View):
         elif self.state.is_full: status = f"{e('FULL')}**СЛОТЫ ЗАПОЛНЕНЫ**"
         else: status = f"{e('OPEN')}**СБОР ОТКРЫТ**"
         
-        desc = (
-            f"{status}\n\n"
-            f"{e('TIME')}**Время:** <t:{self.state.ts}:F> (<t:{self.state.ts}:R>)\n"
-            f"{e('SLOTS')}**Слоты:** `{self.state.used} / {self.state.total_slots}` (Осн: {self.state.base_slots} + Доп: {self.state.extra_slots})"
-        )
+        desc = f"{status} {e('TIME')}<t:{self.state.ts}:F> (<t:{self.state.ts}:R>)"
         
         # Получаем кастомный эмодзи для заголовка
         ev_emoji = EVENT_EMOJIS.get(self.state.event_type, e('PLUS'))
         emb = brand_embed(title=f"{ev_emoji} PLUS | {self.state.event_type}", description=desc)
-        emb.add_field(name=f"{e('PEOPLE')}Участники", value=await self._participants_text(guild), inline=False)
+        emb.add_field(
+            name=f"Участники: {e('PEOPLE')}{self.state.used}/{self.state.total_slots}",
+            value=await self._participants_text(guild),
+            inline=False,
+        )
         
         if self.state.logs_enabled and self.state.logs_thread_id: 
             emb.add_field(name=f"{e('RECEIPT')}Ветка сбора", value=f"<#{self.state.logs_thread_id}>", inline=False)
