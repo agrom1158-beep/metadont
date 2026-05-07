@@ -147,8 +147,20 @@ def format_amount(amount: int) -> str:
     return f"{amount:,}".replace(",", " ")
 
 
+def _to_ui_container(container) -> disnake.ui.Container:
+    """Гарантирует, что контейнер — disnake.ui.Container.
+
+    `inter.message.components[0]` возвращает ``disnake.components.Container``,
+    у которого children — тоже типа ``disnake.components.X``. Чтобы isinstance
+    проверки на ``disnake.ui.X`` работали, конвертируем.
+    """
+    if isinstance(container, disnake.ui.Container):
+        return container
+    return disnake.ui.Container.from_component(container)
+
+
 def resolve_report_status(
-    container: disnake.ui.Container,
+    container,
     is_approved: bool,
     mod_id: int,
     reason: str | None = None,
@@ -162,6 +174,7 @@ def resolve_report_status(
       «Одобрено / Проверил: X / Заполнить отчёт» (как на скрине модератора).
     - Иначе просто убирает все кнопки, оставляя медиа и текст.
     """
+    container = _to_ui_container(container)
     status_emoji = "✅" if is_approved else "❌"
     status_text = "Одобрено" if is_approved else "Отклонено"
     color = SUCCESS_COLOR if is_approved else ERROR_COLOR
@@ -1047,8 +1060,9 @@ class AcceptSpecialModal(disnake.ui.Modal):
         mod_label = (
             getattr(inter.author, "display_name", None) or inter.author.name
         )[:60]
+        container = _to_ui_container(self.container)
         new_children: list = []
-        for child in self.container.children:
+        for child in container.children:
             if isinstance(child, disnake.ui.TextDisplay):
                 text = child.content.replace(
                     f"`? {COIN_SYMBOL}`", f"`{price} {COIN_SYMBOL}`"
