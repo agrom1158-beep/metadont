@@ -466,6 +466,39 @@ def _file_upload_label(label: str = "Скриншоты", required: bool = True)
     )
 
 
+def _no_files_diag_text(inter: disnake.ModalInteraction) -> str:
+    """Текст эфемерной подсказки, когда вложений не нашлось.
+
+    Кроме обычной строки «нужно прикрепить хотя бы один скриншот» дописывает
+    краткий дамп `inter.data.components` и `inter.data.resolved` —
+    пользователь может скинуть скриншот, и я починю под его версию disnake.
+    """
+    head = f"{e('ERROR')} Нужно прикрепить хотя бы один скриншот."
+    try:
+        comps = getattr(inter.data, "components", None)
+        resolved_attr = getattr(inter.data, "resolved", None)
+        try:
+            raw_resolved = (
+                inter.data.get("resolved") if hasattr(inter.data, "get") else None
+            )
+        except Exception:
+            raw_resolved = None
+
+        comps_str = repr(comps)[:600]
+        resolved_str = repr(resolved_attr)[:300]
+        raw_resolved_str = repr(raw_resolved)[:600]
+
+        return (
+            f"{head}\n"
+            f"-# Если скриншоты были прикреплены — пришлите этот текст автору:\n"
+            f"```\ncomponents={comps_str}\n"
+            f"resolved_attr={resolved_str}\n"
+            f"raw_resolved={raw_resolved_str}\n```"
+        )
+    except Exception:
+        return head
+
+
 def _collect_modal_attachments(
     inter: disnake.ModalInteraction,
 ) -> list[disnake.Attachment]:
@@ -719,7 +752,7 @@ class EarnSubmitModal(disnake.ui.Modal):
         if not files:
             return await inter.followup.send(
                 components=simple_container(
-                    f"{e('ERROR')} Нужно прикрепить хотя бы один скриншот.",
+                    _no_files_diag_text(inter),
                     ERROR_COLOR,
                 ),
                 ephemeral=True,
@@ -866,7 +899,7 @@ class TreasurySubmitModal(disnake.ui.Modal):
         if not files:
             return await inter.followup.send(
                 components=simple_container(
-                    f"{e('ERROR')} Нужно прикрепить хотя бы один скриншот.",
+                    _no_files_diag_text(inter),
                     ERROR_COLOR,
                 ),
                 ephemeral=True,
