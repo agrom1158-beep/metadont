@@ -468,16 +468,40 @@ def _file_upload_label(label: str = "Скриншоты", required: bool = True)
 
 async def _resolve_modal_files(
     inter: disnake.ModalInteraction,
-) -> list[disnake.File]:
-    """Достаёт прикреплённые в модалку файлы и готовит их к повторной отправке."""
+) -> tuple[list[disnake.File], list[disnake.ui.Component]]:
+    """Достаёт прикреплённые в модалку файлы и готовит их к повторной отправке.
+
+    Возвращает кортеж: (files_to_attach, container_children_for_preview).
+    Превью склеивается одной MediaGallery (если есть картинки/видео) и/или
+    набором File-компонентов (для прочих файлов) — Discord отрендерит их
+    прямо внутри Container, и пользователь сможет открыть/скачать каждый файл.
+    """
     raw = inter.resolved_values.get("files") if inter.resolved_values else None
     files: list[disnake.File] = []
-    for att in (raw or [])[:MAX_REPORT_FILES]:
+    gallery_items: list[disnake.MediaGalleryItem] = []
+    file_components: list[disnake.ui.Component] = []
+    for idx, att in enumerate((raw or [])[:MAX_REPORT_FILES]):
         try:
-            files.append(await att.to_file())
+            base_name = (att.filename or f"file_{idx}").replace(" ", "_")
+            unique_name = f"{idx}_{base_name}"
+            f = await att.to_file(filename=unique_name)
+            files.append(f)
+            ct = (att.content_type or "").lower()
+            ref = f"attachment://{unique_name}"
+            if ct.startswith("image/") or ct.startswith("video/"):
+                gallery_items.append(disnake.MediaGalleryItem(ref))
+            else:
+                file_components.append(
+                    disnake.ui.File(disnake.UnfurledMediaItem(ref))
+                )
         except Exception:
             continue
-    return files
+
+    preview: list[disnake.ui.Component] = []
+    if gallery_items:
+        preview.append(disnake.ui.MediaGallery(*gallery_items))
+    preview.extend(file_components)
+    return files, preview
 
 
 async def update_economy_leaderboard(bot):
@@ -591,7 +615,7 @@ class EarnSubmitModal(disnake.ui.Modal):
 
         static_id = inter.text_values["static_id"].strip()
         comment = inter.text_values.get("comment", "").strip()
-        files = await _resolve_modal_files(inter)
+        files, preview = await _resolve_modal_files(inter)
         if not files:
             return await inter.followup.send(
                 components=simple_container(
@@ -615,37 +639,44 @@ class EarnSubmitModal(disnake.ui.Modal):
         ]
         if comment:
             desc_lines.append(f"**Описание:** {comment}")
-        desc_lines.append(f"-# Скриншотов: **{len(files)}** (см. ниже).")
+        desc_lines.append(f"-# Прикреплено файлов: **{len(files)}**")
 
-        cont = [
-            disnake.ui.Container(
-                disnake.ui.TextDisplay("\n".join(desc_lines)),
+        children: list = [
+            disnake.ui.TextDisplay("\n".join(desc_lines)),
+            disnake.ui.Separator(
+                divider=True, spacing=disnake.SeparatorSpacing.small
+            ),
+        ]
+        children.extend(preview)
+        if preview:
+            children.append(
                 disnake.ui.Separator(
                     divider=True, spacing=disnake.SeparatorSpacing.small
-                ),
-                disnake.ui.ActionRow(
-                    disnake.ui.Button(
-                        label="Одобрить",
-                        style=disnake.ButtonStyle.success,
-                        emoji="✅",
-                        custom_id=f"earn_acc:{author.id}:{self.reward}",
-                    ),
-                    disnake.ui.Button(
-                        label="Проверил",
-                        style=disnake.ButtonStyle.secondary,
-                        emoji="👁",
-                        custom_id=f"earn_seen:{author.id}",
-                    ),
-                    disnake.ui.Button(
-                        label="Отклонить",
-                        style=disnake.ButtonStyle.danger,
-                        emoji="❌",
-                        custom_id=f"earn_rej:{author.id}",
-                    ),
-                ),
-                accent_colour=ACCENT_COLOR,
+                )
             )
-        ]
+        children.append(
+            disnake.ui.ActionRow(
+                disnake.ui.Button(
+                    label="Одобрить",
+                    style=disnake.ButtonStyle.success,
+                    emoji="✅",
+                    custom_id=f"earn_acc:{author.id}:{self.reward}",
+                ),
+                disnake.ui.Button(
+                    label="Проверил",
+                    style=disnake.ButtonStyle.secondary,
+                    emoji="👁",
+                    custom_id=f"earn_seen:{author.id}",
+                ),
+                disnake.ui.Button(
+                    label="Отклонить",
+                    style=disnake.ButtonStyle.danger,
+                    emoji="❌",
+                    custom_id=f"earn_rej:{author.id}",
+                ),
+            )
+        )
+        cont = [disnake.ui.Container(*children, accent_colour=ACCENT_COLOR)]
 
         log_channel = inter.bot.get_channel(int(CHANNELS.get("EARN_LOGS") or 0))
         if not log_channel:
@@ -731,7 +762,7 @@ class TreasurySubmitModal(disnake.ui.Modal):
         static_id = inter.text_values["static_id"].strip()
         reason = inter.text_values["reason"].strip()
 
-        files = await _resolve_modal_files(inter)
+        files, preview = await _resolve_modal_files(inter)
         if not files:
             return await inter.followup.send(
                 components=simple_container(
@@ -752,38 +783,45 @@ class TreasurySubmitModal(disnake.ui.Modal):
             f"**Паспорт:** `{static_id}`\n"
             f"**Сумма:** `{formatted_amount}`\n"
             f"**Причина:** {reason}\n"
-            f"-# Скриншотов: **{len(files)}** (см. ниже)."
+            f"-# Прикреплено файлов: **{len(files)}**"
         )
 
-        cont = [
-            disnake.ui.Container(
-                disnake.ui.TextDisplay(desc),
+        children: list = [
+            disnake.ui.TextDisplay(desc),
+            disnake.ui.Separator(
+                divider=True, spacing=disnake.SeparatorSpacing.small
+            ),
+        ]
+        children.extend(preview)
+        if preview:
+            children.append(
                 disnake.ui.Separator(
                     divider=True, spacing=disnake.SeparatorSpacing.small
-                ),
-                disnake.ui.ActionRow(
-                    disnake.ui.Button(
-                        label="Одобрить",
-                        style=disnake.ButtonStyle.success,
-                        emoji="✅",
-                        custom_id=f"treasury_acc:{author.id}",
-                    ),
-                    disnake.ui.Button(
-                        label="Проверил",
-                        style=disnake.ButtonStyle.secondary,
-                        emoji="👁",
-                        custom_id=f"treasury_seen:{author.id}",
-                    ),
-                    disnake.ui.Button(
-                        label="Отклонить",
-                        style=disnake.ButtonStyle.danger,
-                        emoji="❌",
-                        custom_id=f"treasury_rej:{author.id}",
-                    ),
-                ),
-                accent_colour=ACCENT_COLOR,
+                )
             )
-        ]
+        children.append(
+            disnake.ui.ActionRow(
+                disnake.ui.Button(
+                    label="Одобрить",
+                    style=disnake.ButtonStyle.success,
+                    emoji="✅",
+                    custom_id=f"treasury_acc:{author.id}",
+                ),
+                disnake.ui.Button(
+                    label="Проверил",
+                    style=disnake.ButtonStyle.secondary,
+                    emoji="👁",
+                    custom_id=f"treasury_seen:{author.id}",
+                ),
+                disnake.ui.Button(
+                    label="Отклонить",
+                    style=disnake.ButtonStyle.danger,
+                    emoji="❌",
+                    custom_id=f"treasury_rej:{author.id}",
+                ),
+            )
+        )
+        cont = [disnake.ui.Container(*children, accent_colour=ACCENT_COLOR)]
 
         log_channel = inter.bot.get_channel(int(CHANNELS.get("EARN_LOGS") or 0))
         if not log_channel:
