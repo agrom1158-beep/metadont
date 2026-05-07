@@ -45,7 +45,6 @@ ERROR_COLOR = disnake.Colour(0xED4245)   # Красный для отказа
 CHANNELS = {
     "EARN_LOGS": 1497527331089158335,
     "SHOP_LOGS": 1497527148821614702,
-    "TREASURY_LOGS": 1497527331089158335,  # По умолчанию = EARN_LOGS, можно переопределить в config.json
     "LEADERBOARD": 1477407418286739670,
     "ECO_PANEL": 1477407363404140576,
     "TICKET_CATEGORY": 1463910681244991640,
@@ -279,12 +278,6 @@ def build_economy_panel() -> list[disnake.ui.Container]:
                 style=disnake.ButtonStyle.secondary,
                 custom_id="eco_shop",
                 emoji=EMOJIS.get("CART"),
-            ),
-            disnake.ui.Button(
-                label="Отчёт казны",
-                style=disnake.ButtonStyle.secondary,
-                custom_id="eco_treasury",
-                emoji=EMOJIS.get("TREASURY"),
             ),
         )
     )
@@ -717,11 +710,14 @@ class RejectEarnModal(disnake.ui.Modal):
             except Exception:
                 pass
 
+        mod_name = getattr(inter.author, "display_name", None) or inter.author.name
         new_cont = resolve_report_status(
             self.container,
             is_approved=False,
             mod_id=inter.author.id,
             reason=reason,
+            mod_name=mod_name,
+            keep_status_buttons=True,
         )
         await self.message.edit(components=new_cont)
         await inter.followup.send(
@@ -1048,6 +1044,9 @@ class AcceptSpecialModal(disnake.ui.Modal):
             )
             await db.commit()
 
+        mod_label = (
+            getattr(inter.author, "display_name", None) or inter.author.name
+        )[:60]
         new_children: list = []
         for child in self.container.children:
             if isinstance(child, disnake.ui.TextDisplay):
@@ -1063,6 +1062,29 @@ class AcceptSpecialModal(disnake.ui.Modal):
             elif not isinstance(child, disnake.ui.ActionRow):
                 new_children.append(child)
 
+        new_children.append(
+            disnake.ui.ActionRow(
+                disnake.ui.Button(
+                    label="Одобрено",
+                    style=disnake.ButtonStyle.success,
+                    custom_id=f"_s_status:{inter.author.id}",
+                    disabled=True,
+                ),
+                disnake.ui.Button(
+                    label=f"Проверил: {mod_label}",
+                    style=disnake.ButtonStyle.secondary,
+                    custom_id=f"_s_mod:{inter.author.id}",
+                    disabled=True,
+                ),
+                disnake.ui.Button(
+                    label="Заполнить отчёт",
+                    style=disnake.ButtonStyle.secondary,
+                    emoji=e_btn("EDIT"),
+                    custom_id="_s_fill_report",
+                    disabled=True,
+                ),
+            )
+        )
         await self.message.edit(
             components=[disnake.ui.Container(*new_children, accent_colour=SUCCESS_COLOR)]
         )
@@ -1097,11 +1119,14 @@ class RejectOrderModal(disnake.ui.Modal):
     async def callback(self, inter: disnake.ModalInteraction):
         await inter.response.defer(ephemeral=True)
         reason = inter.text_values["reason"]
+        mod_name = getattr(inter.author, "display_name", None) or inter.author.name
         new_cont = resolve_report_status(
             self.container,
             is_approved=False,
             mod_id=inter.author.id,
             reason=reason,
+            mod_name=mod_name,
+            keep_status_buttons=True,
         )
         await self.message.edit(components=new_cont)
         await inter.followup.send(
@@ -1299,49 +1324,17 @@ class EconomyCog(commands.Cog):
                             emoji=EMOJIS.get("WEAPON"),
                             custom_id="type_weapons",
                         ),
+                        disnake.ui.Button(
+                            label="Казна",
+                            style=disnake.ButtonStyle.secondary,
+                            emoji=EMOJIS.get("TREASURY"),
+                            custom_id="type_treasury",
+                        ),
                     ),
                     accent_colour=ACCENT_COLOR,
                 )
             ]
             await temp_channel.send(content=inter.author.mention, components=cont)
-            inter.bot.loop.create_task(auto_delete_ticket(temp_channel, 300))
-            await inter.followup.send(
-                components=simple_container(
-                    f"{e('SUCCESS')} Перейдите в {temp_channel.mention}",
-                    SUCCESS_COLOR,
-                ),
-                ephemeral=True,
-            )
-            return
-
-        if custom_id == "eco_treasury":
-            await inter.response.defer(ephemeral=True)
-            guild = inter.guild
-            category = guild.get_channel(CHANNELS.get("TICKET_CATEGORY"))
-
-            overwrites = {
-                guild.default_role: disnake.PermissionOverwrite(read_messages=False),
-                inter.author: disnake.PermissionOverwrite(
-                    read_messages=True, send_messages=True, attach_files=True
-                ),
-                guild.me: disnake.PermissionOverwrite(
-                    read_messages=True, send_messages=True, manage_channels=True
-                ),
-            }
-            temp_channel = await guild.create_text_channel(
-                name=f"казна-{inter.author.name}",
-                category=category,
-                overwrites=overwrites,
-            )
-
-            ACTIVE_TREASURY[inter.author.id] = {
-                "channel_id": temp_channel.id,
-            }
-
-            await temp_channel.send(
-                content=inter.author.mention,
-                components=build_treasury_action_container(),
-            )
             inter.bot.loop.create_task(auto_delete_ticket(temp_channel, 300))
             await inter.followup.send(
                 components=simple_container(
@@ -1427,6 +1420,15 @@ class EconomyCog(commands.Cog):
             }
             await inter.response.edit_message(
                 components=build_cart_container(inter.author.id)
+            )
+            return
+
+        if custom_id == "type_treasury":
+            ACTIVE_TREASURY[inter.author.id] = {
+                "channel_id": inter.channel.id,
+            }
+            await inter.response.edit_message(
+                components=build_treasury_action_container()
             )
             return
 
@@ -1628,10 +1630,10 @@ class EconomyCog(commands.Cog):
                     ephemeral=True,
                 )
 
-            log_channel = inter.bot.get_channel(int(CHANNELS["TREASURY_LOGS"]))
+            log_channel = inter.bot.get_channel(int(CHANNELS["EARN_LOGS"]))
             if not log_channel:
                 return await inter.followup.send(
-                    "Ошибка: Канал логов казны не найден.", ephemeral=True
+                    "Ошибка: Канал логов не найден.", ephemeral=True
                 )
 
             formatted_amount = format_amount(data["amount"])
@@ -1767,10 +1769,15 @@ class EconomyCog(commands.Cog):
                 )
                 await db.commit()
 
+            mod_name = (
+                getattr(inter.author, "display_name", None) or inter.author.name
+            )
             new_cont = resolve_report_status(
                 inter.message.components[0],
                 is_approved=True,
                 mod_id=inter.author.id,
+                mod_name=mod_name,
+                keep_status_buttons=True,
             )
             await inter.message.edit(components=new_cont)
             await inter.followup.send(
@@ -1871,10 +1878,15 @@ class EconomyCog(commands.Cog):
                 )
                 await db.commit()
 
+            mod_name = (
+                getattr(inter.author, "display_name", None) or inter.author.name
+            )
             new_cont = resolve_report_status(
                 inter.message.components[0],
                 is_approved=True,
                 mod_id=inter.author.id,
+                mod_name=mod_name,
+                keep_status_buttons=True,
             )
             await inter.message.edit(components=new_cont)
             await inter.followup.send(
