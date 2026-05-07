@@ -466,62 +466,82 @@ def _file_upload_label(label: str = "Скриншоты", required: bool = True)
     )
 
 
-def _no_files_diag_text(inter: disnake.ModalInteraction) -> str:
-    """Текст эфемерной подсказки, когда вложений не нашлось.
+def _is_attachment_like(obj) -> bool:
+    """Утка-тайпинг для Attachment — на случай разных билдов disnake.
 
-    Кроме обычной строки «нужно прикрепить хотя бы один скриншот» дописывает
-    краткий дамп `inter.data.components` и `inter.data.resolved` —
-    пользователь может скинуть скриншот, и я починю под его версию disnake.
+    Не зависим от ``isinstance(obj, disnake.Attachment)``, потому что в
+    разных установках/форках класс может оказаться не тем же объектом.
     """
-    head = f"{e('ERROR')} Нужно прикрепить хотя бы один скриншот."
-    try:
-        comps = getattr(inter.data, "components", None)
-        resolved_attr = getattr(inter.data, "resolved", None)
-        try:
-            raw_resolved = (
-                inter.data.get("resolved") if hasattr(inter.data, "get") else None
-            )
-        except Exception:
-            raw_resolved = None
-
-        comps_str = repr(comps)[:600]
-        resolved_str = repr(resolved_attr)[:300]
-        raw_resolved_str = repr(raw_resolved)[:600]
-
-        return (
-            f"{head}\n"
-            f"-# Если скриншоты были прикреплены — пришлите этот текст автору:\n"
-            f"```\ncomponents={comps_str}\n"
-            f"resolved_attr={resolved_str}\n"
-            f"raw_resolved={raw_resolved_str}\n```"
-        )
-    except Exception:
-        return head
+    return (
+        obj is not None
+        and hasattr(obj, "id")
+        and hasattr(obj, "filename")
+        and hasattr(obj, "to_file")
+    )
 
 
-def _collect_modal_attachments(
-    inter: disnake.ModalInteraction,
-) -> list[disnake.Attachment]:
-    """Собирает все Attachment из модалки.
+def _collect_modal_attachments(inter: disnake.ModalInteraction) -> list:
+    """Собирает все Attachment из модалки максимально устойчиво.
 
-    Несколько fallback-путей, потому что disnake разных версий и Discord-
-    события приходят по-разному (resolved_values, data.resolved.attachments,
-    raw data dict).
+    Главный путь — пройти по ``inter.data.components`` (как структура
+    приходит от Discord), найти ``file_upload`` (type=19) внутри ``label``
+    (type=18) и взять Attachment из ``inter.data.resolved.attachments`` по
+    snowflake. Параллельно есть несколько резервных путей: чистый
+    ``resolved_values`` disnake, прямой обход ``data.resolved.attachments``
+    и сборка из сырого ``data["resolved"]["attachments"]`` если повезёт.
     """
-    found: list[disnake.Attachment] = []
+    found: list = []
     seen_ids: set[int] = set()
 
     def _push(att) -> None:
-        if att is None or not isinstance(att, disnake.Attachment):
+        if not _is_attachment_like(att):
             return
-        if att.id in seen_ids:
+        try:
+            aid = int(att.id)
+        except Exception:
             return
-        seen_ids.add(att.id)
+        if aid in seen_ids:
+            return
+        seen_ids.add(aid)
         found.append(att)
 
-    # 1) resolved_values (disnake 2.12+) — основной путь
+    def _walk(items):
+        for c in items or []:
+            if not isinstance(c, dict):
+                continue
+            t = c.get("type")
+            if t == 1 and "components" in c:  # action_row
+                yield from _walk(c["components"])
+            elif t == 18 and "component" in c:  # label
+                yield from _walk([c["component"]])
+            else:
+                yield c
+
+    # PRIMARY: components -> file_upload(values) -> resolved.attachments by id.
     try:
-        rv = inter.resolved_values or {}
+        resolved_obj = getattr(inter.data, "resolved", None)
+        atts_map = getattr(resolved_obj, "attachments", None) or {}
+        for comp in _walk(getattr(inter.data, "components", []) or []):
+            if comp.get("type") != 19:  # file_upload
+                continue
+            for vid in comp.get("values") or []:
+                # ключ в InteractionDataResolved.attachments — int.
+                try:
+                    att = atts_map.get(int(vid))
+                except Exception:
+                    att = None
+                if att is None:
+                    att = atts_map.get(str(vid))
+                _push(att)
+    except Exception as ex:
+        print(f"[economy] primary walk failed: {ex!r}")
+
+    if found:
+        return found
+
+    # 2) disnake resolved_values
+    try:
+        rv = getattr(inter, "resolved_values", None) or {}
         for v in rv.values():
             if isinstance(v, (list, tuple)):
                 for item in v:
@@ -532,47 +552,27 @@ def _collect_modal_attachments(
     if found:
         return found
 
-    # 2) Прямо из inter.data.resolved.attachments (если есть)
+    # 3) Просто всё из inter.data.resolved.attachments
     try:
-        resolved = getattr(inter.data, "resolved", None)
-        atts_map = getattr(resolved, "attachments", None) or {}
+        resolved_obj = getattr(inter.data, "resolved", None)
+        atts_map = getattr(resolved_obj, "attachments", None) or {}
         for att in atts_map.values():
             _push(att)
     except Exception as ex:
-        print(f"[economy] data.resolved.attachments failed: {ex!r}")
+        print(f"[economy] resolved.attachments failed: {ex!r}")
 
     if found:
         return found
 
-    # 3) Совсем сырой fallback — обходим data.components вручную и берём
-    #    значения из data["resolved"]["attachments"].
+    # 4) Сырой dict-resolved — конструируем Attachment руками.
     try:
         raw_resolved = (
-            (inter.data.get("resolved") if hasattr(inter.data, "get") else None)
-            or {}
-        )
+            inter.data.get("resolved") if hasattr(inter.data, "get") else None
+        ) or {}
         raw_atts = raw_resolved.get("attachments") or {}
-        state = inter._state if hasattr(inter, "_state") else None
-
-        def _walk(items):
-            for c in items or []:
-                if not isinstance(c, dict):
-                    continue
-                t = c.get("type")
-                if t == 1 and "components" in c:  # action_row
-                    yield from _walk(c["components"])
-                elif t == 18 and "component" in c:  # label
-                    yield from _walk([c["component"]])
-                else:
-                    yield c
-
-        for comp in _walk(getattr(inter.data, "components", []) or []):
-            if comp.get("type") != 19:  # 19 == file_upload
-                continue
-            for vid in comp.get("values") or []:
-                raw_att = raw_atts.get(str(vid))
-                if not raw_att or state is None:
-                    continue
+        state = getattr(inter, "_state", None)
+        if state is not None:
+            for raw_att in raw_atts.values():
                 try:
                     _push(disnake.Attachment(data=raw_att, state=state))
                 except Exception as ex:
@@ -752,7 +752,7 @@ class EarnSubmitModal(disnake.ui.Modal):
         if not files:
             return await inter.followup.send(
                 components=simple_container(
-                    _no_files_diag_text(inter),
+                    f"{e('ERROR')} Нужно прикрепить хотя бы один скриншот.",
                     ERROR_COLOR,
                 ),
                 ephemeral=True,
@@ -899,7 +899,7 @@ class TreasurySubmitModal(disnake.ui.Modal):
         if not files:
             return await inter.followup.send(
                 components=simple_container(
-                    _no_files_diag_text(inter),
+                    f"{e('ERROR')} Нужно прикрепить хотя бы один скриншот.",
                     ERROR_COLOR,
                 ),
                 ephemeral=True,
