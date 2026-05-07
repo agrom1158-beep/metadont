@@ -175,7 +175,7 @@ def resolve_report_status(
             )
             if reason:
                 append_text += f"\n**Причина отказа:** {reason}"
-            new_children.append(disnake.ui.TextDisplay(child.text + append_text))
+            new_children.append(disnake.ui.TextDisplay(child.content + append_text))
         elif not isinstance(child, disnake.ui.ActionRow):
             new_children.append(child)
 
@@ -482,7 +482,7 @@ async def update_economy_leaderboard(bot):
             msg.author == bot.user
             and getattr(msg.flags, "is_components_v2", False)
             and msg.components
-            and "Топ богачей" in msg.components[0].children[0].text
+            and "Топ богачей" in msg.components[0].children[0].content
         ):
             bot_msg = msg
             break
@@ -1050,7 +1050,7 @@ class AcceptSpecialModal(disnake.ui.Modal):
         new_children: list = []
         for child in self.container.children:
             if isinstance(child, disnake.ui.TextDisplay):
-                text = child.text.replace(
+                text = child.content.replace(
                     f"`? {COIN_SYMBOL}`", f"`{price} {COIN_SYMBOL}`"
                 )
                 text += (
@@ -1308,6 +1308,7 @@ class EconomyCog(commands.Cog):
             cont = [
                 disnake.ui.Container(
                     disnake.ui.TextDisplay(
+                        f"{inter.author.mention}\n"
                         f"## {e('REPORT')} Заработок {COIN_NAME}\n"
                         f"У вас есть 5 минут на оформление отчёта."
                     ),
@@ -1334,7 +1335,7 @@ class EconomyCog(commands.Cog):
                     accent_colour=ACCENT_COLOR,
                 )
             ]
-            await temp_channel.send(content=inter.author.mention, components=cont)
+            await temp_channel.send(components=cont)
             inter.bot.loop.create_task(auto_delete_ticket(temp_channel, 300))
             await inter.followup.send(
                 components=simple_container(
