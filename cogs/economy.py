@@ -466,6 +466,90 @@ def _file_upload_label(label: str = "Скриншоты", required: bool = True)
     )
 
 
+def _collect_modal_attachments(
+    inter: disnake.ModalInteraction,
+) -> list[disnake.Attachment]:
+    """Собирает все Attachment из модалки.
+
+    Несколько fallback-путей, потому что disnake разных версий и Discord-
+    события приходят по-разному (resolved_values, data.resolved.attachments,
+    raw data dict).
+    """
+    found: list[disnake.Attachment] = []
+    seen_ids: set[int] = set()
+
+    def _push(att) -> None:
+        if att is None or not isinstance(att, disnake.Attachment):
+            return
+        if att.id in seen_ids:
+            return
+        seen_ids.add(att.id)
+        found.append(att)
+
+    # 1) resolved_values (disnake 2.12+) — основной путь
+    try:
+        rv = inter.resolved_values or {}
+        for v in rv.values():
+            if isinstance(v, (list, tuple)):
+                for item in v:
+                    _push(item)
+    except Exception as ex:
+        print(f"[economy] resolved_values failed: {ex!r}")
+
+    if found:
+        return found
+
+    # 2) Прямо из inter.data.resolved.attachments (если есть)
+    try:
+        resolved = getattr(inter.data, "resolved", None)
+        atts_map = getattr(resolved, "attachments", None) or {}
+        for att in atts_map.values():
+            _push(att)
+    except Exception as ex:
+        print(f"[economy] data.resolved.attachments failed: {ex!r}")
+
+    if found:
+        return found
+
+    # 3) Совсем сырой fallback — обходим data.components вручную и берём
+    #    значения из data["resolved"]["attachments"].
+    try:
+        raw_resolved = (
+            (inter.data.get("resolved") if hasattr(inter.data, "get") else None)
+            or {}
+        )
+        raw_atts = raw_resolved.get("attachments") or {}
+        state = inter._state if hasattr(inter, "_state") else None
+
+        def _walk(items):
+            for c in items or []:
+                if not isinstance(c, dict):
+                    continue
+                t = c.get("type")
+                if t == 1 and "components" in c:  # action_row
+                    yield from _walk(c["components"])
+                elif t == 18 and "component" in c:  # label
+                    yield from _walk([c["component"]])
+                else:
+                    yield c
+
+        for comp in _walk(getattr(inter.data, "components", []) or []):
+            if comp.get("type") != 19:  # 19 == file_upload
+                continue
+            for vid in comp.get("values") or []:
+                raw_att = raw_atts.get(str(vid))
+                if not raw_att or state is None:
+                    continue
+                try:
+                    _push(disnake.Attachment(data=raw_att, state=state))
+                except Exception as ex:
+                    print(f"[economy] Attachment ctor failed: {ex!r}")
+    except Exception as ex:
+        print(f"[economy] raw walk failed: {ex!r}")
+
+    return found
+
+
 async def _resolve_modal_files(
     inter: disnake.ModalInteraction,
 ) -> tuple[list[disnake.File], list[disnake.ui.Component]]:
@@ -476,11 +560,26 @@ async def _resolve_modal_files(
     набором File-компонентов (для прочих файлов) — Discord отрендерит их
     прямо внутри Container, и пользователь сможет открыть/скачать каждый файл.
     """
-    raw = inter.resolved_values.get("files") if inter.resolved_values else None
+    attachments = _collect_modal_attachments(inter)
+    if not attachments:
+        # Диагностика — пишем в лог что прислал Discord, чтобы проще ловить
+        # расхождения между версиями disnake / Discord API.
+        try:
+            raw_components = getattr(inter.data, "components", None)
+            raw_resolved = (
+                inter.data.get("resolved") if hasattr(inter.data, "get") else None
+            )
+            print(
+                "[economy] no attachments resolved | "
+                f"components={raw_components!r} resolved={raw_resolved!r}"
+            )
+        except Exception:
+            pass
+
     files: list[disnake.File] = []
     gallery_items: list[disnake.MediaGalleryItem] = []
     file_components: list[disnake.ui.Component] = []
-    for idx, att in enumerate((raw or [])[:MAX_REPORT_FILES]):
+    for idx, att in enumerate(attachments[:MAX_REPORT_FILES]):
         try:
             base_name = (att.filename or f"file_{idx}").replace(" ", "_")
             unique_name = f"{idx}_{base_name}"
@@ -494,7 +593,8 @@ async def _resolve_modal_files(
                 file_components.append(
                     disnake.ui.File(disnake.UnfurledMediaItem(ref))
                 )
-        except Exception:
+        except Exception as ex:
+            print(f"[economy] to_file failed for {getattr(att, 'filename', '?')}: {ex!r}")
             continue
 
     preview: list[disnake.ui.Component] = []
