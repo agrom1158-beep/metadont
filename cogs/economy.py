@@ -85,13 +85,13 @@ for _ch_key, _ch_val in (config.get("CHANNELS", {}) or {}).items():
         CHANNELS[_ch_key] = _ch_val
 
 ACTIVE_CARTS: dict[int, dict] = {}
-ACTIVE_TICKETS: dict[int, dict] = {}
 ACTIVE_ORDERS: dict[int, dict] = {}
-ACTIVE_TREASURY: dict[int, dict] = {}
 
 # Действия для отчёта казны
 TREASURY_ACTIONS = ("Снятие", "Пополнение")
-MAX_TREASURY_FILES = 10
+MAX_REPORT_FILES = 10
+# Совместимость со старым именем (использовалось снаружи)
+MAX_TREASURY_FILES = MAX_REPORT_FILES
 
 
 def e(key: str) -> str:
@@ -124,15 +124,6 @@ async def get_user_balance(user_id: int) -> int:
             return row[0] if row else 0
 
 
-async def auto_delete_ticket(channel: disnake.TextChannel, delay: int) -> None:
-    """Авто-удаление временного канала через заданное число секунд."""
-    try:
-        await asyncio.sleep(delay)
-        await channel.delete()
-    except Exception:
-        pass
-
-
 def is_moderator(member: disnake.Member) -> bool:
     """Проверка, что пользователь — модератор согласно config.json (ROLES.MODERATOR)."""
     mod_roles = config.get("ROLES", {}).get("MODERATOR", []) or []
@@ -157,6 +148,56 @@ def _to_ui_container(container) -> disnake.ui.Container:
     if isinstance(container, disnake.ui.Container):
         return container
     return disnake.ui.Container.from_component(container)
+
+
+def mark_report_seen(
+    container,
+    mod_id: int,
+    mod_name: str,
+    seen_prefix: str,
+) -> list[disnake.ui.Container]:
+    """Помечает отчёт как «проверен» модератором.
+
+    Кнопка с custom_id, начинающимся на ``seen_prefix``, заменяется на
+    неактивную «Проверил: NAME». Остальные кнопки (Одобрить / Отклонить)
+    продолжают работать. Текст контейнера дополняется строкой о проверке.
+    """
+    container = _to_ui_container(container)
+    label = (mod_name or str(mod_id))[:60]
+
+    new_children: list = []
+    seen_marker = f"\n-# 👁 Проверил: <@{mod_id}>"
+    for child in container.children:
+        if isinstance(child, disnake.ui.TextDisplay):
+            text = child.content
+            if seen_marker not in text:
+                text = f"{text}{seen_marker}"
+            new_children.append(disnake.ui.TextDisplay(text))
+        elif isinstance(child, disnake.ui.ActionRow):
+            new_btns: list = []
+            for btn in child.children:
+                if (
+                    isinstance(btn, disnake.ui.Button)
+                    and btn.custom_id
+                    and btn.custom_id.startswith(seen_prefix)
+                ):
+                    new_btns.append(
+                        disnake.ui.Button(
+                            label=f"Проверил: {label}",
+                            style=disnake.ButtonStyle.secondary,
+                            emoji="👁",
+                            custom_id=f"_seen_done:{mod_id}",
+                            disabled=True,
+                        )
+                    )
+                else:
+                    new_btns.append(btn)
+            new_children.append(disnake.ui.ActionRow(*new_btns))
+        else:
+            new_children.append(child)
+
+    accent = getattr(container, "accent_colour", None) or ACCENT_COLOR
+    return [disnake.ui.Container(*new_children, accent_colour=accent)]
 
 
 def resolve_report_status(
@@ -373,7 +414,11 @@ def build_cart_container(user_id: int) -> list[disnake.ui.Container]:
 
 
 def build_treasury_action_container() -> list[disnake.ui.Container]:
-    """Контейнер с селектом для выбора типа операции казны (Снятие/Пополнение)."""
+    """Контейнер с селектом для выбора типа операции казны (Снятие/Пополнение).
+
+    Показывается эфемерно после клика «Казна» в меню «Получить TC».
+    После выбора пользователь сразу попадает в модалку с полями + загрузкой файлов.
+    """
     options = [
         disnake.SelectOption(
             label="Снятие",
@@ -392,11 +437,8 @@ def build_treasury_action_container() -> list[disnake.ui.Container]:
         disnake.ui.Container(
             disnake.ui.TextDisplay(
                 f"## {e('TREASURY')} Отчёт казны\n"
-                f"{e('DOT')} **Шаг 1:** Выберите тип операции ниже.\n"
-                f"{e('DOT')} **Шаг 2:** Заполните форму (паспорт, сумма, причина).\n"
-                f"{e('DOT')} **Шаг 3:** Прикрепите до **{MAX_TREASURY_FILES}** "
-                f"скриншотов/видео в этот канал и нажмите «Отправить отчёт».\n\n"
-                f"-# Канал авто-удалится через 5 минут."
+                f"{e('DOT')} Выберите тип операции — откроется форма со всеми полями "
+                f"и загрузкой до **{MAX_REPORT_FILES}** скриншотов прямо в окне."
             ),
             disnake.ui.ActionRow(
                 disnake.ui.StringSelect(
@@ -410,44 +452,32 @@ def build_treasury_action_container() -> list[disnake.ui.Container]:
     ]
 
 
-def build_treasury_upload_container(action: str, static_id: str, amount: int, reason: str) -> list[disnake.ui.Container]:
-    """Контейнер, в котором пользователь видит сохранённые данные и кнопку отправки."""
-    formatted_amount = format_amount(amount)
-    return [
-        disnake.ui.Container(
-            disnake.ui.TextDisplay(
-                f"## {e('TREASURY')} Загрузка доказательств\n"
-                f"**Действие:** {action}\n"
-                f"**Паспорт:** `{static_id}`\n"
-                f"**Сумма:** `{formatted_amount}`\n"
-                f"**Причина:** {reason}\n\n"
-                f"{e('ATTACH')} Прикрепите до **{MAX_TREASURY_FILES}** файлов "
-                f"(скриншоты/видео) в этот канал и нажмите «Отправить отчёт».\n"
-                f"-# Размер каждого файла ограничен лимитами Discord."
-            ),
-            disnake.ui.ActionRow(
-                disnake.ui.Button(
-                    label="Изменить данные",
-                    style=disnake.ButtonStyle.secondary,
-                    emoji=e_btn("EDIT"),
-                    custom_id="treasury_edit",
-                ),
-                disnake.ui.Button(
-                    label="Отправить отчёт",
-                    style=disnake.ButtonStyle.success,
-                    emoji=EMOJIS.get("SUCCESS"),
-                    custom_id="treasury_submit",
-                ),
-                disnake.ui.Button(
-                    label="Отменить",
-                    style=disnake.ButtonStyle.danger,
-                    emoji=EMOJIS.get("REJECT"),
-                    custom_id="treasury_cancel",
-                ),
-            ),
-            accent_colour=ACCENT_COLOR,
-        )
-    ]
+def _file_upload_label(label: str = "Скриншоты", required: bool = True) -> disnake.ui.Label:
+    """Готовый Label с FileUpload (1–MAX_REPORT_FILES файлов)."""
+    return disnake.ui.Label(
+        label,
+        component=disnake.ui.FileUpload(
+            custom_id="files",
+            min_values=1 if required else 0,
+            max_values=MAX_REPORT_FILES,
+            required=required,
+        ),
+        description=f"Прикрепите до {MAX_REPORT_FILES} файлов (скриншоты/видео).",
+    )
+
+
+async def _resolve_modal_files(
+    inter: disnake.ModalInteraction,
+) -> list[disnake.File]:
+    """Достаёт прикреплённые в модалку файлы и готовит их к повторной отправке."""
+    raw = inter.resolved_values.get("files") if inter.resolved_values else None
+    files: list[disnake.File] = []
+    for att in (raw or [])[:MAX_REPORT_FILES]:
+        try:
+            files.append(await att.to_file())
+        except Exception:
+            continue
+    return files
 
 
 async def update_economy_leaderboard(bot):
@@ -516,18 +546,23 @@ async def update_economy_leaderboard(bot):
 # МОДАЛКИ (ТИКЕТЫ И МАГАЗИН)
 # ==========================================
 class EarnSubmitModal(disnake.ui.Modal):
+    """Модалка для отчёта за РП-мероприятие или сдачи оружия.
+
+    Поля: статик, описание, до 10 файлов (FileUpload).
+    Файлы и описание сразу постятся в канал EARN_LOGS — никаких временных каналов.
+    """
+
     def __init__(
         self,
         user_id: int,
         detail_text: str,
         reward: int,
-        origin_message: disnake.Message,
         is_weapon: bool = False,
     ):
         self.user_id = user_id
         self.detail_text = detail_text
         self.reward = reward
-        self.origin_message = origin_message
+        self.is_weapon = is_weapon
         components = [
             disnake.ui.TextInput(
                 label="Номер паспорта (Статик)",
@@ -544,6 +579,7 @@ class EarnSubmitModal(disnake.ui.Modal):
                 style=disnake.TextInputStyle.paragraph,
                 required=False,
             ),
+            _file_upload_label("Скриншоты (1–10)"),
         ]
         super().__init__(
             title=("Сдача Оружия" if is_weapon else "Отчёт за РП"),
@@ -551,58 +587,104 @@ class EarnSubmitModal(disnake.ui.Modal):
         )
 
     async def callback(self, inter: disnake.ModalInteraction):
-        ACTIVE_TICKETS[self.user_id] = {
-            "detail_text": self.detail_text,
-            "reward": self.reward,
-            "static_id": inter.text_values["static_id"].strip(),
-            "comment": inter.text_values.get("comment", "").strip(),
-        }
+        await inter.response.defer(ephemeral=True)
+
+        static_id = inter.text_values["static_id"].strip()
+        comment = inter.text_values.get("comment", "").strip()
+        files = await _resolve_modal_files(inter)
+        if not files:
+            return await inter.followup.send(
+                components=simple_container(
+                    f"{e('ERROR')} Нужно прикрепить хотя бы один скриншот.",
+                    ERROR_COLOR,
+                ),
+                ephemeral=True,
+            )
+
+        author = inter.author
+        author_name = getattr(author, "display_name", None) or author.name
+        kind = f"{e('WEAPON')} Сдача оружия" if self.is_weapon else f"{e('REPORT')} Отчёт за РП"
+
+        desc_lines = [
+            f"## {kind}",
+            f"**Игрок:** {author.mention} (`{author_name}`)",
+            f"**ID Discord:** `{author.id}`",
+            f"**Паспорт:** `{static_id}`",
+            f"**Действие:** {self.detail_text}",
+            f"**Сумма:** `{self.reward} {COIN_SYMBOL}`",
+        ]
+        if comment:
+            desc_lines.append(f"**Описание:** {comment}")
+        desc_lines.append(f"-# Скриншотов: **{len(files)}** (см. ниже).")
 
         cont = [
             disnake.ui.Container(
-                disnake.ui.TextDisplay(
-                    f"## {e('REPORT')} Загрузка доказательств\n"
-                    f"**Действие:** {self.detail_text}\n"
-                    f"**Сумма к получению:** `{self.reward} {COIN_SYMBOL}`\n\n"
-                    f"{e('DOT')} **Шаг 1:** Прикрепите до 10 скриншотов в этот канал.\n"
-                    f"{e('DOT')} **Шаг 2:** Нажмите кнопку **«Отправить отчёт»**.\n\n"
-                    f"-# Для отмены нажмите «Отменить»."
+                disnake.ui.TextDisplay("\n".join(desc_lines)),
+                disnake.ui.Separator(
+                    divider=True, spacing=disnake.SeparatorSpacing.small
                 ),
                 disnake.ui.ActionRow(
                     disnake.ui.Button(
-                        label="Отправить отчёт",
+                        label="Одобрить",
                         style=disnake.ButtonStyle.success,
-                        emoji=EMOJIS.get("SUCCESS"),
-                        custom_id="ticket_submit",
+                        emoji="✅",
+                        custom_id=f"earn_acc:{author.id}:{self.reward}",
                     ),
                     disnake.ui.Button(
-                        label="Отменить",
+                        label="Проверил",
+                        style=disnake.ButtonStyle.secondary,
+                        emoji="👁",
+                        custom_id=f"earn_seen:{author.id}",
+                    ),
+                    disnake.ui.Button(
+                        label="Отклонить",
                         style=disnake.ButtonStyle.danger,
-                        emoji=EMOJIS.get("REJECT"),
-                        custom_id="ticket_cancel",
+                        emoji="❌",
+                        custom_id=f"earn_rej:{author.id}",
                     ),
                 ),
                 accent_colour=ACCENT_COLOR,
             )
         ]
-        await self.origin_message.edit(components=cont)
-        await inter.response.send_message(
+
+        log_channel = inter.bot.get_channel(int(CHANNELS.get("EARN_LOGS") or 0))
+        if not log_channel:
+            return await inter.followup.send(
+                components=simple_container(
+                    f"{e('ERROR')} Канал EARN_LOGS не настроен.",
+                    ERROR_COLOR,
+                ),
+                ephemeral=True,
+            )
+
+        try:
+            await log_channel.send(components=cont, files=files)
+        except Exception as ex:
+            return await inter.followup.send(
+                components=simple_container(
+                    f"{e('ERROR')} Не удалось отправить отчёт: `{ex}`",
+                    ERROR_COLOR,
+                ),
+                ephemeral=True,
+            )
+
+        await inter.followup.send(
             components=simple_container(
-                f"{e('SUCCESS')} Данные сохранены! Теперь скиньте скриншоты в этот чат.",
-                SUCCESS_COLOR,
+                f"{e('SUCCESS')} Отчёт отправлен на проверку!", SUCCESS_COLOR
             ),
             ephemeral=True,
         )
 
 
 class TreasurySubmitModal(disnake.ui.Modal):
-    """Модалка отчёта казны: паспорт, сумма, причина."""
+    """Модалка отчёта казны: паспорт, сумма, причина + загрузка до 10 скриншотов.
 
-    def __init__(self, user_id: int, action: str, origin_message: disnake.Message):
+    Сразу из колбэка отчёт уходит в EARN_LOGS — без временных каналов.
+    """
+
+    def __init__(self, user_id: int, action: str):
         self.user_id = user_id
         self.action = action
-        self.origin_message = origin_message
-        prefilled = ACTIVE_TREASURY.get(user_id, {})
         components = [
             disnake.ui.TextInput(
                 label="Номер паспорта",
@@ -611,7 +693,6 @@ class TreasurySubmitModal(disnake.ui.Modal):
                 style=disnake.TextInputStyle.short,
                 max_length=20,
                 required=True,
-                value=prefilled.get("static_id", ""),
             ),
             disnake.ui.TextInput(
                 label="Сумма",
@@ -620,7 +701,6 @@ class TreasurySubmitModal(disnake.ui.Modal):
                 style=disnake.TextInputStyle.short,
                 max_length=15,
                 required=True,
-                value=str(prefilled.get("amount", "")) if prefilled.get("amount") else "",
             ),
             disnake.ui.TextInput(
                 label="Причина",
@@ -629,8 +709,8 @@ class TreasurySubmitModal(disnake.ui.Modal):
                 style=disnake.TextInputStyle.paragraph,
                 required=True,
                 max_length=1000,
-                value=prefilled.get("reason", ""),
             ),
+            _file_upload_label("Скриншоты (1–10)"),
         ]
         super().__init__(title=f"Отчёт казны: {action}", components=components)
 
@@ -645,39 +725,90 @@ class TreasurySubmitModal(disnake.ui.Modal):
                 ephemeral=True,
             )
 
+        await inter.response.defer(ephemeral=True)
+
         amount = int(amount_raw)
         static_id = inter.text_values["static_id"].strip()
         reason = inter.text_values["reason"].strip()
 
-        ACTIVE_TREASURY[self.user_id] = {
-            "action": self.action,
-            "static_id": static_id,
-            "amount": amount,
-            "reason": reason,
-        }
+        files = await _resolve_modal_files(inter)
+        if not files:
+            return await inter.followup.send(
+                components=simple_container(
+                    f"{e('ERROR')} Нужно прикрепить хотя бы один скриншот.",
+                    ERROR_COLOR,
+                ),
+                ephemeral=True,
+            )
+
+        author = inter.author
+        author_name = getattr(author, "display_name", None) or author.name
+        formatted_amount = format_amount(amount)
+
+        desc = (
+            f"## {e('TREASURY')} Отчёт казны: {self.action}\n"
+            f"**Игрок:** {author.mention} (`{author_name}`)\n"
+            f"**ID Discord:** `{author.id}`\n"
+            f"**Паспорт:** `{static_id}`\n"
+            f"**Сумма:** `{formatted_amount}`\n"
+            f"**Причина:** {reason}\n"
+            f"-# Скриншотов: **{len(files)}** (см. ниже)."
+        )
+
+        cont = [
+            disnake.ui.Container(
+                disnake.ui.TextDisplay(desc),
+                disnake.ui.Separator(
+                    divider=True, spacing=disnake.SeparatorSpacing.small
+                ),
+                disnake.ui.ActionRow(
+                    disnake.ui.Button(
+                        label="Одобрить",
+                        style=disnake.ButtonStyle.success,
+                        emoji="✅",
+                        custom_id=f"treasury_acc:{author.id}",
+                    ),
+                    disnake.ui.Button(
+                        label="Проверил",
+                        style=disnake.ButtonStyle.secondary,
+                        emoji="👁",
+                        custom_id=f"treasury_seen:{author.id}",
+                    ),
+                    disnake.ui.Button(
+                        label="Отклонить",
+                        style=disnake.ButtonStyle.danger,
+                        emoji="❌",
+                        custom_id=f"treasury_rej:{author.id}",
+                    ),
+                ),
+                accent_colour=ACCENT_COLOR,
+            )
+        ]
+
+        log_channel = inter.bot.get_channel(int(CHANNELS.get("EARN_LOGS") or 0))
+        if not log_channel:
+            return await inter.followup.send(
+                components=simple_container(
+                    f"{e('ERROR')} Канал EARN_LOGS не настроен.",
+                    ERROR_COLOR,
+                ),
+                ephemeral=True,
+            )
 
         try:
-            await self.origin_message.edit(
-                components=build_treasury_upload_container(
-                    self.action, static_id, amount, reason
-                )
+            await log_channel.send(components=cont, files=files)
+        except Exception as ex:
+            return await inter.followup.send(
+                components=simple_container(
+                    f"{e('ERROR')} Не удалось отправить отчёт: `{ex}`",
+                    ERROR_COLOR,
+                ),
+                ephemeral=True,
             )
-        except Exception:
-            # Сообщение могло быть удалено — отправим новое
-            try:
-                await inter.channel.send(
-                    components=build_treasury_upload_container(
-                        self.action, static_id, amount, reason
-                    )
-                )
-            except Exception:
-                pass
 
-        await inter.response.send_message(
+        await inter.followup.send(
             components=simple_container(
-                f"{e('SUCCESS')} Данные сохранены! Прикрепите до "
-                f"{MAX_TREASURY_FILES} файлов и нажмите «Отправить отчёт».",
-                SUCCESS_COLOR,
+                f"{e('SUCCESS')} Отчёт казны отправлен на проверку!", SUCCESS_COLOR
             ),
             ephemeral=True,
         )
@@ -1218,7 +1349,6 @@ class EconomyCog(commands.Cog):
                     inter.author.id,
                     event_type,
                     RP_REWARDS[event_type],
-                    inter.message,
                     is_weapon=False,
                 )
             )
@@ -1258,9 +1388,8 @@ class EconomyCog(commands.Cog):
                     ),
                     ephemeral=True,
                 )
-            ACTIVE_TREASURY.setdefault(inter.author.id, {})["action"] = action
             await inter.response.send_modal(
-                TreasurySubmitModal(inter.author.id, action, inter.message)
+                TreasurySubmitModal(inter.author.id, action)
             )
 
     # -----------------------------------------
@@ -1300,31 +1429,12 @@ class EconomyCog(commands.Cog):
             return
 
         if custom_id == "eco_earn":
-            await inter.response.defer(ephemeral=True)
-            guild = inter.guild
-            category = guild.get_channel(CHANNELS.get("TICKET_CATEGORY"))
-
-            overwrites = {
-                guild.default_role: disnake.PermissionOverwrite(read_messages=False),
-                inter.author: disnake.PermissionOverwrite(
-                    read_messages=True, send_messages=True, attach_files=True
-                ),
-                guild.me: disnake.PermissionOverwrite(
-                    read_messages=True, send_messages=True, manage_channels=True
-                ),
-            }
-            temp_channel = await guild.create_text_channel(
-                name=f"отчёт-{inter.author.name}",
-                category=category,
-                overwrites=overwrites,
-            )
-
             cont = [
                 disnake.ui.Container(
                     disnake.ui.TextDisplay(
-                        f"{inter.author.mention}\n"
                         f"## {e('REPORT')} Заработок {COIN_NAME}\n"
-                        f"У вас есть 5 минут на оформление отчёта."
+                        f"Выберите тип отчёта — далее откроется форма с полями "
+                        f"и загрузкой до **{MAX_REPORT_FILES}** скриншотов прямо в окне."
                     ),
                     disnake.ui.ActionRow(
                         disnake.ui.Button(
@@ -1349,15 +1459,7 @@ class EconomyCog(commands.Cog):
                     accent_colour=ACCENT_COLOR,
                 )
             ]
-            await temp_channel.send(components=cont)
-            inter.bot.loop.create_task(auto_delete_ticket(temp_channel, 300))
-            await inter.followup.send(
-                components=simple_container(
-                    f"{e('SUCCESS')} Перейдите в {temp_channel.mention}",
-                    SUCCESS_COLOR,
-                ),
-                ephemeral=True,
-            )
+            await inter.response.send_message(components=cont, ephemeral=True)
             return
 
         if custom_id == "eco_shop":
@@ -1439,9 +1541,6 @@ class EconomyCog(commands.Cog):
             return
 
         if custom_id == "type_treasury":
-            ACTIVE_TREASURY[inter.author.id] = {
-                "channel_id": inter.channel.id,
-            }
             await inter.response.edit_message(
                 components=build_treasury_action_container()
             )
@@ -1495,208 +1594,12 @@ class EconomyCog(commands.Cog):
                         inter.author.id,
                         summary,
                         total_lc,
-                        inter.message,
                         is_weapon=True,
                     )
                 )
-            return
-
-        if custom_id == "ticket_submit":
-            data = ACTIVE_TICKETS.get(inter.author.id)
-            if not data:
-                return await inter.response.send_message(
-                    components=simple_container(
-                        f"{e('ERROR')} Сессия истекла.", ERROR_COLOR
-                    ),
-                    ephemeral=True,
-                )
-
-            await inter.response.defer()
-            files_to_upload: list[disnake.File] = []
-            async for msg in inter.channel.history(limit=50):
-                if msg.author.id == inter.author.id and msg.attachments:
-                    for att in msg.attachments:
-                        files_to_upload.append(await att.to_file())
-
-            if not files_to_upload:
-                return await inter.followup.send(
-                    components=simple_container(
-                        f"{e('ERROR')} Скриншоты не найдены. Сначала загрузите их в канал!",
-                        ERROR_COLOR,
-                    ),
-                    ephemeral=True,
-                )
-            log_channel = inter.bot.get_channel(int(CHANNELS["EARN_LOGS"]))
-            if not log_channel:
-                return await inter.followup.send(
-                    "Ошибка: Канал логов не найден.", ephemeral=True
-                )
-
-            desc = (
-                f"**Отправил:** <@{inter.author.id}>\n"
-                f"**Паспорт:** `{data['static_id']}`\n"
-                f"**Действие:** Заработок ({data['detail_text']})\n"
-                f"**Сумма:** `{data['reward']} {COIN_SYMBOL}`\n"
-            )
-            if data["comment"]:
-                desc += f"**Причина:** {data['comment']}\n"
-
-            btn_acc = f"earn_acc:{inter.author.id}:{data['reward']}"
-            btn_rej = f"earn_rej:{inter.author.id}"
-
-            cont = [
-                disnake.ui.Container(
-                    disnake.ui.TextDisplay(
-                        f"## {e('REPORT')} Отчёт о транзакции\n" + desc
-                    ),
-                    disnake.ui.Separator(
-                        divider=True, spacing=disnake.SeparatorSpacing.small
-                    ),
-                    disnake.ui.ActionRow(
-                        disnake.ui.Button(
-                            label="Одобрить",
-                            style=disnake.ButtonStyle.success,
-                            emoji="✅",
-                            custom_id=btn_acc,
-                        ),
-                        disnake.ui.Button(
-                            label="Отклонить",
-                            style=disnake.ButtonStyle.danger,
-                            emoji="❌",
-                            custom_id=btn_rej,
-                        ),
-                    ),
-                    accent_colour=MAIN_COLOR,
-                )
-            ]
-
-            await log_channel.send(
-                components=cont, files=files_to_upload[:MAX_TREASURY_FILES]
-            )
-            try:
-                await inter.channel.delete()
-            except Exception:
-                pass
-            if inter.author.id in ACTIVE_TICKETS:
-                del ACTIVE_TICKETS[inter.author.id]
-            return
-
-        if custom_id == "ticket_cancel":
-            try:
-                await inter.channel.delete()
-            except Exception:
-                pass
-            if inter.author.id in ACTIVE_TICKETS:
-                del ACTIVE_TICKETS[inter.author.id]
-            return
-
-        # ----------- TREASURY: edit / cancel / submit -----------
-        if custom_id == "treasury_edit":
-            data = ACTIVE_TREASURY.get(inter.author.id)
-            if not data or "action" not in data:
-                return await inter.response.send_message(
-                    components=simple_container(
-                        f"{e('ERROR')} Сессия устарела. Начните заново.", ERROR_COLOR
-                    ),
-                    ephemeral=True,
-                )
-            await inter.response.send_modal(
-                TreasurySubmitModal(inter.author.id, data["action"], inter.message)
-            )
-            return
-
-        if custom_id == "treasury_cancel":
-            try:
-                await inter.channel.delete()
-            except Exception:
-                pass
-            if inter.author.id in ACTIVE_TREASURY:
-                del ACTIVE_TREASURY[inter.author.id]
-            return
-
-        if custom_id == "treasury_submit":
-            data = ACTIVE_TREASURY.get(inter.author.id)
-            if not data or "action" not in data or "amount" not in data:
-                return await inter.response.send_message(
-                    components=simple_container(
-                        f"{e('ERROR')} Сначала выберите тип операции и заполните форму.",
-                        ERROR_COLOR,
-                    ),
-                    ephemeral=True,
-                )
-
-            await inter.response.defer()
-            files_to_upload: list[disnake.File] = []
-            async for msg in inter.channel.history(limit=50):
-                if msg.author.id == inter.author.id and msg.attachments:
-                    for att in msg.attachments:
-                        files_to_upload.append(await att.to_file())
-                        if len(files_to_upload) >= MAX_TREASURY_FILES:
-                            break
-                if len(files_to_upload) >= MAX_TREASURY_FILES:
-                    break
-
-            if not files_to_upload:
-                return await inter.followup.send(
-                    components=simple_container(
-                        f"{e('ERROR')} Доказательства не найдены. Прикрепите файлы и попробуйте снова.",
-                        ERROR_COLOR,
-                    ),
-                    ephemeral=True,
-                )
-
-            log_channel = inter.bot.get_channel(int(CHANNELS["EARN_LOGS"]))
-            if not log_channel:
-                return await inter.followup.send(
-                    "Ошибка: Канал логов не найден.", ephemeral=True
-                )
-
-            formatted_amount = format_amount(data["amount"])
-            desc = (
-                f"**Отправил:** <@{inter.author.id}>\n"
-                f"**Паспорт:** `{data['static_id']}`\n"
-                f"**Действие:** {data['action']}\n"
-                f"**Сумма:** `{formatted_amount}`\n"
-                f"**Причина:** {data['reason']}\n"
-            )
-
-            btn_acc = f"treasury_acc:{inter.author.id}:{data['amount']}"
-            btn_rej = f"treasury_rej:{inter.author.id}"
-
-            cont = [
-                disnake.ui.Container(
-                    disnake.ui.TextDisplay(
-                        f"## {e('REPORT')} Отчёт о транзакции\n" + desc
-                    ),
-                    disnake.ui.Separator(
-                        divider=True, spacing=disnake.SeparatorSpacing.small
-                    ),
-                    disnake.ui.ActionRow(
-                        disnake.ui.Button(
-                            label="Одобрить",
-                            style=disnake.ButtonStyle.success,
-                            emoji="✅",
-                            custom_id=btn_acc,
-                        ),
-                        disnake.ui.Button(
-                            label="Отклонить",
-                            style=disnake.ButtonStyle.danger,
-                            emoji="❌",
-                            custom_id=btn_rej,
-                        ),
-                    ),
-                    accent_colour=ACCENT_COLOR,
-                )
-            ]
-            await log_channel.send(
-                components=cont, files=files_to_upload[:MAX_TREASURY_FILES]
-            )
-            try:
-                await inter.channel.delete()
-            except Exception:
-                pass
-            if inter.author.id in ACTIVE_TREASURY:
-                del ACTIVE_TREASURY[inter.author.id]
+                # Удаляем сессию корзины — данные уже ушли в модалку
+                if inter.author.id in ACTIVE_CARTS:
+                    del ACTIVE_CARTS[inter.author.id]
             return
 
         # ----------- SHOP confirm / cancel -----------
@@ -1803,6 +1706,21 @@ class EconomyCog(commands.Cog):
             )
             return
 
+        if custom_id.startswith("earn_seen:"):
+            if not is_moderator(inter.author):
+                return
+            mod_name = (
+                getattr(inter.author, "display_name", None) or inter.author.name
+            )
+            new_cont = mark_report_seen(
+                inter.message.components[0],
+                mod_id=inter.author.id,
+                mod_name=mod_name,
+                seen_prefix="earn_seen:",
+            )
+            await inter.response.edit_message(components=new_cont)
+            return
+
         if custom_id.startswith("earn_rej:"):
             if not is_moderator(inter.author):
                 return
@@ -1853,6 +1771,21 @@ class EconomyCog(commands.Cog):
                 ),
                 ephemeral=True,
             )
+            return
+
+        if custom_id.startswith("treasury_seen:"):
+            if not is_moderator(inter.author):
+                return
+            mod_name = (
+                getattr(inter.author, "display_name", None) or inter.author.name
+            )
+            new_cont = mark_report_seen(
+                inter.message.components[0],
+                mod_id=inter.author.id,
+                mod_name=mod_name,
+                seen_prefix="treasury_seen:",
+            )
+            await inter.response.edit_message(components=new_cont)
             return
 
         if custom_id.startswith("treasury_rej:"):
