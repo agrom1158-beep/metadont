@@ -26,6 +26,17 @@ MAX_APPLICATION_FILES = 10
 APPLICATION_SELECT_CID = "application_action_select"
 APPLICATION_OPTION_CREATE = "create_app"
 
+# Топ рекрутеров: список периодов (key, label, timedelta | None)
+TOPREC_PERIODS: list[tuple[str, str, datetime.timedelta | None]] = [
+    ("day", "День", datetime.timedelta(days=1)),
+    ("week", "Неделя", datetime.timedelta(days=7)),
+    ("month", "Месяц", datetime.timedelta(days=30)),
+    ("half_year", "Полгода", datetime.timedelta(days=182)),
+    ("all", "Всё время", None),
+]
+TOPREC_DEFAULT_PERIOD = "day"
+TOPREC_BUTTON_PREFIX = "toprec:"
+
 
 # ==========================================
 # ПОМОЩНИКИ ДЛЯ ЭМОДЗИ
@@ -457,6 +468,107 @@ def build_application_panel() -> list[disnake.ui.Container]:
     )
     children.append(disnake.ui.ActionRow(select))
 
+    return [
+        disnake.ui.Container(
+            *children, accent_colour=disnake.Colour(SKY_BLUE)
+        )
+    ]
+
+
+# ==========================================
+# COMPONENTS V2: ПАНЕЛЬ "ТОП РЕКРУТЕРОВ"
+# ==========================================
+def _toprec_period_meta(
+    period_key: str,
+) -> tuple[str, datetime.timedelta | None]:
+    for key, label, delta in TOPREC_PERIODS:
+        if key == period_key:
+            return label, delta
+    label, delta = TOPREC_PERIODS[0][1], TOPREC_PERIODS[0][2]
+    return label, delta
+
+
+async def _load_toprec_rows(
+    period_key: str, limit: int = 10
+) -> list[tuple[str, int]]:
+    _, delta = _toprec_period_meta(period_key)
+    rows: list[tuple[str, int]] = []
+    async with aiosqlite.connect("data/database.sqlite") as db:
+        if delta is None:
+            sql = (
+                "SELECT recruiter_id, COUNT(*) AS cnt FROM applications "
+                "WHERE status = 'accepted' AND recruiter_id IS NOT NULL "
+                "GROUP BY recruiter_id ORDER BY cnt DESC LIMIT ?"
+            )
+            params: tuple = (limit,)
+        else:
+            since = (datetime.datetime.utcnow() - delta).isoformat(
+                timespec="seconds"
+            )
+            sql = (
+                "SELECT recruiter_id, COUNT(*) AS cnt FROM applications "
+                "WHERE status = 'accepted' AND recruiter_id IS NOT NULL "
+                "AND accepted_at IS NOT NULL AND accepted_at >= ? "
+                "GROUP BY recruiter_id ORDER BY cnt DESC LIMIT ?"
+            )
+            params = (since, limit)
+        async with db.execute(sql, params) as cur:
+            async for r in cur:
+                rows.append((str(r[0]), int(r[1])))
+    return rows
+
+
+def _format_toprec_rows(rows: list[tuple[str, int]]) -> str:
+    if not rows:
+        return "-# Нет принятых заявок за этот период"
+    medals = ("🥇", "🥈", "🥉")
+    lines: list[str] = []
+    for i, (uid, cnt) in enumerate(rows):
+        prefix = medals[i] if i < len(medals) else f"`{i + 1:>2}.`"
+        lines.append(f"{prefix} <@{uid}> — **{cnt}**")
+    return "\n".join(lines)
+
+
+def _build_toprec_buttons(active_key: str) -> disnake.ui.ActionRow:
+    buttons: list[disnake.ui.Button] = []
+    for key, label, _ in TOPREC_PERIODS:
+        buttons.append(
+            disnake.ui.Button(
+                label=label,
+                style=(
+                    disnake.ButtonStyle.primary
+                    if key == active_key
+                    else disnake.ButtonStyle.secondary
+                ),
+                custom_id=f"{TOPREC_BUTTON_PREFIX}{key}",
+                disabled=(key == active_key),
+            )
+        )
+    return disnake.ui.ActionRow(*buttons)
+
+
+async def _build_toprec_container(
+    period_key: str,
+) -> list[disnake.ui.Container]:
+    label, _ = _toprec_period_meta(period_key)
+    rows = await _load_toprec_rows(period_key)
+
+    children: list = [
+        disnake.ui.TextDisplay(
+            f"## {e('LOGS')}Топ рекрутеров\n"
+            "Сколько заявок каждый модератор принял за выбранный период."
+        ),
+        disnake.ui.Separator(
+            divider=True, spacing=disnake.SeparatorSpacing.small
+        ),
+        disnake.ui.TextDisplay(
+            f"### {label}\n{_format_toprec_rows(rows)}"
+        ),
+        disnake.ui.Separator(
+            divider=True, spacing=disnake.SeparatorSpacing.small
+        ),
+        _build_toprec_buttons(period_key),
+    ]
     return [
         disnake.ui.Container(
             *children, accent_colour=disnake.Colour(SKY_BLUE)
@@ -1169,6 +1281,25 @@ class ApplicationsCog(commands.Cog):
         if not custom_id:
             return
 
+        if custom_id.startswith(TOPREC_BUTTON_PREFIX):
+            if not inter.author.guild_permissions.administrator:
+                return await inter.response.send_message(
+                    f"{e('REJECT')}Панель доступна только администраторам.",
+                    ephemeral=True,
+                )
+            period_key = custom_id[len(TOPREC_BUTTON_PREFIX):]
+            if period_key not in {k for k, _, _ in TOPREC_PERIODS}:
+                period_key = TOPREC_DEFAULT_PERIOD
+            cont = await _build_toprec_container(period_key)
+            try:
+                await inter.response.edit_message(components=cont)
+            except Exception:
+                try:
+                    await inter.message.edit(components=cont)
+                except Exception:
+                    pass
+            return
+
         if custom_id.startswith(("accept_", "reject_", "call_")):
             moderator_roles = config.get("ROLES", {}).get("MODERATOR", [])
             is_mod = any(
@@ -1394,86 +1525,28 @@ class ApplicationsCog(commands.Cog):
             pass
 
     @commands.command(name="toprec")
+    @commands.has_permissions(administrator=True)
     async def toprec(self, ctx: commands.Context):
-        """Топ рекрутеров по числу принятых заявок (день/неделя/месяц/полгода/всё время)."""
-        now = datetime.datetime.utcnow()
-        periods: list[tuple[str, datetime.datetime | None]] = [
-            ("За день", now - datetime.timedelta(days=1)),
-            ("За неделю", now - datetime.timedelta(days=7)),
-            ("За месяц", now - datetime.timedelta(days=30)),
-            ("За полгода", now - datetime.timedelta(days=182)),
-            ("За всё время", None),
-        ]
-
-        async def _top_for(
-            db, since: datetime.datetime | None, limit: int = 10
-        ) -> list[tuple[str, int]]:
-            if since is None:
-                sql = (
-                    "SELECT recruiter_id, COUNT(*) AS cnt FROM applications "
-                    "WHERE status = 'accepted' AND recruiter_id IS NOT NULL "
-                    "GROUP BY recruiter_id ORDER BY cnt DESC LIMIT ?"
-                )
-                params: tuple = (limit,)
-            else:
-                sql = (
-                    "SELECT recruiter_id, COUNT(*) AS cnt FROM applications "
-                    "WHERE status = 'accepted' AND recruiter_id IS NOT NULL "
-                    "AND accepted_at IS NOT NULL AND accepted_at >= ? "
-                    "GROUP BY recruiter_id ORDER BY cnt DESC LIMIT ?"
-                )
-                params = (since.isoformat(timespec="seconds"), limit)
-            rows: list[tuple[str, int]] = []
-            async with db.execute(sql, params) as cur:
-                async for r in cur:
-                    rows.append((str(r[0]), int(r[1])))
-            return rows
-
-        async with aiosqlite.connect("data/database.sqlite") as db:
-            results = []
-            for title, since in periods:
-                results.append((title, await _top_for(db, since)))
-
-        def _fmt_rows(rows: list[tuple[str, int]]) -> str:
-            if not rows:
-                return "-# Нет принятых заявок за этот период"
-            medals = ("🥇", "🥈", "🥉")
-            lines = []
-            for i, (uid, cnt) in enumerate(rows):
-                prefix = medals[i] if i < len(medals) else f"`{i + 1:>2}.`"
-                lines.append(f"{prefix} <@{uid}> — **{cnt}**")
-            return "\n".join(lines)
-
-        children: list = [
-            disnake.ui.TextDisplay(
-                f"## {e('LOGS')}Топ рекрутеров\n"
-                "Сколько заявок каждый модератор принял за разные периоды."
-            ),
-            disnake.ui.Separator(
-                divider=True, spacing=disnake.SeparatorSpacing.small
-            ),
-        ]
-        for idx, (title, rows) in enumerate(results):
-            children.append(
-                disnake.ui.TextDisplay(f"### {title}\n{_fmt_rows(rows)}")
-            )
-            if idx < len(results) - 1:
-                children.append(
-                    disnake.ui.Separator(
-                        divider=True,
-                        spacing=disnake.SeparatorSpacing.small,
-                    )
-                )
-
-        cont = [
-            disnake.ui.Container(
-                *children, accent_colour=disnake.Colour(SKY_BLUE)
-            )
-        ]
+        """Топ рекрутеров: один период с переключением кнопками (админ-only)."""
+        cont = await _build_toprec_container(TOPREC_DEFAULT_PERIOD)
         await ctx.send(
             components=cont,
             allowed_mentions=disnake.AllowedMentions.none(),
         )
+
+    @toprec.error
+    async def toprec_error(
+        self, ctx: commands.Context, error: commands.CommandError
+    ):
+        if isinstance(error, commands.MissingPermissions):
+            try:
+                await ctx.reply(
+                    f"{e('REJECT')}Команда доступна только администраторам.",
+                    mention_author=False,
+                    delete_after=10,
+                )
+            except Exception:
+                pass
 
 
 def setup(bot):
