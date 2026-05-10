@@ -304,6 +304,52 @@ def _build_review_buttons(target_user_id: int) -> disnake.ui.ActionRow:
     )
 
 
+def _extract_media_urls(msg: disnake.Message) -> list[str]:
+    """Возвращает список CDN-URL картинок/файлов из v2-сообщения.
+
+    Сначала пробует `msg.attachments` (если Discord вернул их в обычном
+    списке). Если пусто — рекурсивно обходит `msg.components`, забирая
+    `media.url` / `media.proxy_url` из всех `MediaGallery` и `File`-чайлдов
+    (для v2-сообщений Discord прячет файлы внутри компонентов).
+    """
+    urls: list[str] = []
+    seen: set[str] = set()
+
+    def _push(url: str | None) -> None:
+        if not url:
+            return
+        if url.startswith("attachment://"):
+            return
+        if url in seen:
+            return
+        seen.add(url)
+        urls.append(url)
+
+    for att in getattr(msg, "attachments", None) or []:
+        _push(getattr(att, "url", None) or getattr(att, "proxy_url", None))
+
+    def _walk(node) -> None:
+        if node is None:
+            return
+        media = getattr(node, "media", None)
+        if media is not None:
+            _push(
+                getattr(media, "url", None)
+                or getattr(media, "proxy_url", None)
+            )
+        for items_attr in ("items", "children"):
+            items = getattr(node, items_attr, None)
+            if not items:
+                continue
+            for child in items:
+                _walk(child)
+
+    for component in getattr(msg, "components", None) or []:
+        _walk(component)
+
+    return urls
+
+
 def _extract_application_text(msg: disnake.Message) -> str:
     """Возвращает текст анкеты из Container'а заявки.
 
@@ -726,10 +772,7 @@ class AcceptModal(disnake.ui.Modal):
 
             screenshot_urls: list[str] = []
             if app_msg is not None:
-                screenshot_urls = [
-                    a.url
-                    for a in (getattr(app_msg, "attachments", None) or [])
-                ]
+                screenshot_urls = _extract_media_urls(app_msg)
 
             # 1) Тихий пинг отдельным сообщением (silent=True — без push-
             #    уведомления, но @ остаётся как ссылка-меншн).
