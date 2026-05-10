@@ -345,12 +345,11 @@ def build_application_panel() -> list[disnake.ui.Container]:
             disnake.ui.MediaGallery(disnake.MediaGalleryItem(banner_url))
         )
 
-    title_icon = e("SHIELD") or e("WAVE") or ""
     children.append(
         disnake.ui.TextDisplay(
-            f"## {title_icon}Оформление заявки в семью.\n"
+            "## <a:qq:1485470088600621219>Оформление заявки в семью.\n"
             "Уведомление о приглашении на обзвон отправляется в личные сообщения.\n"
-            "Заявки открыты только на 16 сервер Denver"
+            "Заявки открыты только на 17 сервер Portland <:Portland:1501581436036186244>"
         )
     )
 
@@ -361,7 +360,7 @@ def build_application_panel() -> list[disnake.ui.Container]:
     )
     children.append(
         disnake.ui.TextDisplay(
-            "> В среднем заявки обрабатываются в течение 1-2 дней"
+            "> В среднем заявки обрабатываются в течение 12-ти часов"
         )
     )
 
