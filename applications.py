@@ -532,8 +532,18 @@ class ApplicationModal(disnake.ui.Modal):
         mentions = " ".join(
             [f"<@&{r}>" for r in config["ROLES"]["MODERATOR"]]
         )
+        # У v2-сообщений с components нельзя одновременно использовать
+        # content/embed, поэтому пинг ролей идёт отдельным сообщением.
+        try:
+            await ticket_channel.send(
+                content=f"{mentions}\nНовая заявка от {inter.author.mention}",
+                allowed_mentions=disnake.AllowedMentions(
+                    roles=True, users=True
+                ),
+            )
+        except Exception:
+            pass
         msg = await ticket_channel.send(
-            content=f"{mentions}\nНовая заявка от {inter.author.mention}",
             components=cont,
             files=files,
         )
