@@ -14,10 +14,28 @@ with open("config.json", "r", encoding="utf-8") as f:
 # Константы для дизайна
 INVISIBLE_COLOR = 0x2B2D31
 SKY_BLUE = 0x87CEEB  # «небесно-голубой» акцент Container'а панели заявок
+ACCENT_COLOR = disnake.Colour(SKY_BLUE)
+SUCCESS_COLOR = disnake.Colour(0x2E8B57)
+ERROR_COLOR = disnake.Colour(0xED4245)
+ORANGE_COLOR = disnake.Colour(0xE67E22)
+
+# Максимум фото персонажей, которые можно прикрепить к заявке
+MAX_APPLICATION_FILES = 10
 
 # Persistent custom ids
 APPLICATION_SELECT_CID = "application_action_select"
 APPLICATION_OPTION_CREATE = "create_app"
+
+# Топ рекрутеров: список периодов (key, label, timedelta | None)
+TOPREC_PERIODS: list[tuple[str, str, datetime.timedelta | None]] = [
+    ("day", "День", datetime.timedelta(days=1)),
+    ("week", "Неделя", datetime.timedelta(days=7)),
+    ("month", "Месяц", datetime.timedelta(days=30)),
+    ("half_year", "Полгода", datetime.timedelta(days=182)),
+    ("all", "Всё время", None),
+]
+TOPREC_DEFAULT_PERIOD = "day"
+TOPREC_BUTTON_PREFIX = "toprec:"
 
 
 # ==========================================
@@ -50,6 +68,324 @@ def get_safe_banner() -> str:
 
 
 # ==========================================
+# ХЕЛПЕРЫ ДЛЯ COMPONENTS V2
+# ==========================================
+def simple_container(
+    text: str, color: disnake.Colour = ACCENT_COLOR
+) -> list[disnake.ui.Container]:
+    return [
+        disnake.ui.Container(
+            disnake.ui.TextDisplay(text), accent_colour=color
+        )
+    ]
+
+
+def _to_ui_container(container) -> disnake.ui.Container:
+    """Гарантирует, что контейнер — disnake.ui.Container.
+
+    ``inter.message.components[0]`` возвращает ``disnake.components.Container``,
+    у которого children — тоже типа ``disnake.components.X``. Чтобы isinstance
+    проверки на ``disnake.ui.X`` работали, конвертируем.
+    """
+    if isinstance(container, disnake.ui.Container):
+        return container
+    return disnake.ui.Container.from_component(container)
+
+
+def _file_upload_label(
+    label: str = "Фото персонажей",
+    required: bool = True,
+    max_files: int = MAX_APPLICATION_FILES,
+) -> disnake.ui.Label:
+    """Готовый Label с FileUpload (1–max_files файлов)."""
+    return disnake.ui.Label(
+        label,
+        component=disnake.ui.FileUpload(
+            custom_id="files",
+            min_values=1 if required else 0,
+            max_values=max_files,
+            required=required,
+        ),
+        description=(
+            f"Прикрепите до {max_files} фото персонажей "
+            "(скриншоты из игры)."
+        ),
+    )
+
+
+def _is_attachment_like(obj) -> bool:
+    """Утка-тайпинг для Attachment — на случай разных билдов disnake."""
+    return (
+        obj is not None
+        and hasattr(obj, "id")
+        and hasattr(obj, "filename")
+        and hasattr(obj, "to_file")
+    )
+
+
+def _collect_modal_attachments(inter: disnake.ModalInteraction) -> list:
+    """Собирает все Attachment из модалки максимально устойчиво.
+
+    Главный путь — пройти по ``inter.data.components`` (как структура
+    приходит от Discord), найти ``file_upload`` (type=19) внутри ``label``
+    (type=18) и взять Attachment из ``inter.data.resolved.attachments`` по
+    snowflake. Параллельно есть несколько резервных путей: чистый
+    ``resolved_values`` disnake, прямой обход ``data.resolved.attachments``
+    и сборка из сырого ``data["resolved"]["attachments"]`` если повезёт.
+    """
+    found: list = []
+    seen_ids: set[int] = set()
+
+    def _push(att) -> None:
+        if not _is_attachment_like(att):
+            return
+        try:
+            aid = int(att.id)
+        except Exception:
+            return
+        if aid in seen_ids:
+            return
+        seen_ids.add(aid)
+        found.append(att)
+
+    def _walk(items):
+        for c in items or []:
+            if not isinstance(c, dict):
+                continue
+            t = c.get("type")
+            if t == 1 and "components" in c:  # action_row
+                yield from _walk(c["components"])
+            elif t == 18 and "component" in c:  # label
+                yield from _walk([c["component"]])
+            else:
+                yield c
+
+    # PRIMARY: components -> file_upload(values) -> resolved.attachments by id.
+    try:
+        resolved_obj = getattr(inter.data, "resolved", None)
+        atts_map = getattr(resolved_obj, "attachments", None) or {}
+        for comp in _walk(getattr(inter.data, "components", []) or []):
+            if comp.get("type") != 19:  # file_upload
+                continue
+            for vid in comp.get("values") or []:
+                try:
+                    att = atts_map.get(int(vid))
+                except Exception:
+                    att = None
+                if att is None:
+                    att = atts_map.get(str(vid))
+                _push(att)
+    except Exception as ex:
+        print(f"[applications] primary walk failed: {ex!r}")
+
+    if found:
+        return found
+
+    # 2) disnake resolved_values
+    try:
+        rv = getattr(inter, "resolved_values", None) or {}
+        for v in rv.values():
+            if isinstance(v, (list, tuple)):
+                for item in v:
+                    _push(item)
+    except Exception as ex:
+        print(f"[applications] resolved_values failed: {ex!r}")
+
+    if found:
+        return found
+
+    # 3) Просто всё из inter.data.resolved.attachments
+    try:
+        resolved_obj = getattr(inter.data, "resolved", None)
+        atts_map = getattr(resolved_obj, "attachments", None) or {}
+        for att in atts_map.values():
+            _push(att)
+    except Exception as ex:
+        print(f"[applications] resolved.attachments failed: {ex!r}")
+
+    if found:
+        return found
+
+    # 4) Сырой dict-resolved — конструируем Attachment руками.
+    try:
+        raw_resolved = (
+            inter.data.get("resolved")
+            if hasattr(inter.data, "get")
+            else None
+        ) or {}
+        raw_atts = raw_resolved.get("attachments") or {}
+        state = getattr(inter, "_state", None)
+        if state is not None:
+            for raw_att in raw_atts.values():
+                try:
+                    _push(disnake.Attachment(data=raw_att, state=state))
+                except Exception as ex:
+                    print(f"[applications] Attachment ctor failed: {ex!r}")
+    except Exception as ex:
+        print(f"[applications] raw walk failed: {ex!r}")
+
+    return found
+
+
+async def _resolve_modal_files(
+    inter: disnake.ModalInteraction,
+) -> tuple[list[disnake.File], list[disnake.ui.Component]]:
+    """Достаёт прикреплённые в модалку файлы и готовит их к повторной отправке.
+
+    Возвращает кортеж: (files_to_attach, container_children_for_preview).
+    Превью склеивается одной MediaGallery (если есть картинки/видео) и/или
+    набором File-компонентов (для прочих файлов) — Discord отрендерит их
+    прямо внутри Container, и пользователь сможет открыть/скачать каждый файл.
+    """
+    attachments = _collect_modal_attachments(inter)
+    if not attachments:
+        try:
+            raw_components = getattr(inter.data, "components", None)
+            raw_resolved = (
+                inter.data.get("resolved")
+                if hasattr(inter.data, "get")
+                else None
+            )
+            print(
+                "[applications] no attachments resolved | "
+                f"components={raw_components!r} resolved={raw_resolved!r}"
+            )
+        except Exception:
+            pass
+
+    files: list[disnake.File] = []
+    gallery_items: list[disnake.MediaGalleryItem] = []
+    file_components: list[disnake.ui.Component] = []
+    for idx, att in enumerate(attachments[:MAX_APPLICATION_FILES]):
+        try:
+            base_name = (att.filename or f"file_{idx}").replace(" ", "_")
+            unique_name = f"{idx}_{base_name}"
+            try:
+                f = await att.to_file(filename=unique_name)
+            except TypeError:
+                f = await att.to_file()
+                try:
+                    f.filename = unique_name
+                except Exception:
+                    pass
+            files.append(f)
+            ct = (att.content_type or "").lower()
+            ref = f"attachment://{unique_name}"
+            if ct.startswith("image/") or ct.startswith("video/"):
+                gallery_items.append(disnake.MediaGalleryItem(ref))
+            else:
+                file_components.append(
+                    disnake.ui.File(disnake.UnfurledMediaItem(ref))
+                )
+        except Exception as ex:
+            print(
+                f"[applications] to_file failed for "
+                f"{getattr(att, 'filename', '?')}: {ex!r}"
+            )
+            continue
+
+    preview: list[disnake.ui.Component] = []
+    if gallery_items:
+        preview.append(disnake.ui.MediaGallery(*gallery_items))
+    preview.extend(file_components)
+    return files, preview
+
+
+def _build_review_buttons(target_user_id: int) -> disnake.ui.ActionRow:
+    """Кнопки модерации заявки (Принять / Отклонить / Обзвон)."""
+    return disnake.ui.ActionRow(
+        disnake.ui.Button(
+            label="Принять",
+            emoji=e_btn("SUCCESS"),
+            style=disnake.ButtonStyle.success,
+            custom_id=f"accept_{target_user_id}",
+        ),
+        disnake.ui.Button(
+            label="Отклонить",
+            emoji=e_btn("REJECT"),
+            style=disnake.ButtonStyle.danger,
+            custom_id=f"reject_{target_user_id}",
+        ),
+        disnake.ui.Button(
+            label="Обзвон",
+            emoji=e_btn("CALL"),
+            style=disnake.ButtonStyle.secondary,
+            custom_id=f"call_{target_user_id}",
+        ),
+    )
+
+
+def _extract_media_urls(msg: disnake.Message) -> list[str]:
+    """Возвращает список CDN-URL картинок/файлов из v2-сообщения.
+
+    Сначала пробует `msg.attachments` (если Discord вернул их в обычном
+    списке). Если пусто — рекурсивно обходит `msg.components`, забирая
+    `media.url` / `media.proxy_url` из всех `MediaGallery` и `File`-чайлдов
+    (для v2-сообщений Discord прячет файлы внутри компонентов).
+    """
+    urls: list[str] = []
+    seen: set[str] = set()
+
+    def _push(url: str | None) -> None:
+        if not url:
+            return
+        if url.startswith("attachment://"):
+            return
+        if url in seen:
+            return
+        seen.add(url)
+        urls.append(url)
+
+    for att in getattr(msg, "attachments", None) or []:
+        _push(getattr(att, "url", None) or getattr(att, "proxy_url", None))
+
+    def _walk(node) -> None:
+        if node is None:
+            return
+        media = getattr(node, "media", None)
+        if media is not None:
+            _push(
+                getattr(media, "url", None)
+                or getattr(media, "proxy_url", None)
+            )
+        for items_attr in ("items", "children"):
+            items = getattr(node, items_attr, None)
+            if not items:
+                continue
+            for child in items:
+                _walk(child)
+
+    for component in getattr(msg, "components", None) or []:
+        _walk(component)
+
+    return urls
+
+
+def _extract_application_text(msg: disnake.Message) -> str:
+    """Возвращает текст анкеты из Container'а заявки.
+
+    Сначала пытается достать содержимое первого ``TextDisplay`` из
+    ``msg.components[0]``. Если сообщение пришло в старом формате
+    (через ``embeds``), берёт ``embeds[0].description``.
+    """
+    try:
+        if getattr(msg, "components", None):
+            cont = msg.components[0]
+            for child in getattr(cont, "children", []) or []:
+                content = getattr(child, "content", None)
+                if content:
+                    return content
+    except Exception:
+        pass
+    try:
+        if getattr(msg, "embeds", None):
+            return msg.embeds[0].description or ""
+    except Exception:
+        pass
+    return ""
+
+
+# ==========================================
 # COMPONENTS V2: ПАНЕЛЬ "ЗАЯВКИ В СЕМЬЮ"
 # ==========================================
 def build_application_panel() -> list[disnake.ui.Container]:
@@ -66,12 +402,11 @@ def build_application_panel() -> list[disnake.ui.Container]:
             disnake.ui.MediaGallery(disnake.MediaGalleryItem(banner_url))
         )
 
-    title_icon = e("SHIELD") or e("WAVE") or ""
     children.append(
         disnake.ui.TextDisplay(
-            f"## {title_icon}Оформление заявки в семью.\n"
+            "## <a:qq:1485470088600621219>Оформление заявки в семью.\n"
             "Уведомление о приглашении на обзвон отправляется в личные сообщения.\n"
-            "Заявки открыты только на 16 сервер Denver"
+            "Заявки открыты только на 17 сервер Portland <:Portland:1501581436036186244>"
         )
     )
 
@@ -82,7 +417,7 @@ def build_application_panel() -> list[disnake.ui.Container]:
     )
     children.append(
         disnake.ui.TextDisplay(
-            "> В среднем заявки обрабатываются в течение 1-2 дней"
+            "> В среднем заявки обрабатываются в течение 12-ти часов"
         )
     )
 
@@ -141,24 +476,122 @@ def build_application_panel() -> list[disnake.ui.Container]:
 
 
 # ==========================================
+# COMPONENTS V2: ПАНЕЛЬ "ТОП РЕКРУТЕРОВ"
+# ==========================================
+def _toprec_period_meta(
+    period_key: str,
+) -> tuple[str, datetime.timedelta | None]:
+    for key, label, delta in TOPREC_PERIODS:
+        if key == period_key:
+            return label, delta
+    label, delta = TOPREC_PERIODS[0][1], TOPREC_PERIODS[0][2]
+    return label, delta
+
+
+async def _load_toprec_rows(
+    period_key: str, limit: int = 10
+) -> list[tuple[str, int]]:
+    _, delta = _toprec_period_meta(period_key)
+    rows: list[tuple[str, int]] = []
+    async with aiosqlite.connect("data/database.sqlite") as db:
+        if delta is None:
+            sql = (
+                "SELECT recruiter_id, COUNT(*) AS cnt FROM applications "
+                "WHERE status = 'accepted' AND recruiter_id IS NOT NULL "
+                "GROUP BY recruiter_id ORDER BY cnt DESC LIMIT ?"
+            )
+            params: tuple = (limit,)
+        else:
+            since = (datetime.datetime.utcnow() - delta).isoformat(
+                timespec="seconds"
+            )
+            sql = (
+                "SELECT recruiter_id, COUNT(*) AS cnt FROM applications "
+                "WHERE status = 'accepted' AND recruiter_id IS NOT NULL "
+                "AND accepted_at IS NOT NULL AND accepted_at >= ? "
+                "GROUP BY recruiter_id ORDER BY cnt DESC LIMIT ?"
+            )
+            params = (since, limit)
+        async with db.execute(sql, params) as cur:
+            async for r in cur:
+                rows.append((str(r[0]), int(r[1])))
+    return rows
+
+
+def _format_toprec_rows(rows: list[tuple[str, int]]) -> str:
+    if not rows:
+        return "-# Нет принятых заявок за этот период"
+    medals = ("🥇", "🥈", "🥉")
+    lines: list[str] = []
+    for i, (uid, cnt) in enumerate(rows):
+        prefix = medals[i] if i < len(medals) else f"`{i + 1:>2}.`"
+        lines.append(f"{prefix} <@{uid}> — **{cnt}**")
+    return "\n".join(lines)
+
+
+def _build_toprec_buttons(active_key: str) -> disnake.ui.ActionRow:
+    buttons: list[disnake.ui.Button] = []
+    for key, label, _ in TOPREC_PERIODS:
+        buttons.append(
+            disnake.ui.Button(
+                label=label,
+                style=(
+                    disnake.ButtonStyle.primary
+                    if key == active_key
+                    else disnake.ButtonStyle.secondary
+                ),
+                custom_id=f"{TOPREC_BUTTON_PREFIX}{key}",
+                disabled=(key == active_key),
+            )
+        )
+    return disnake.ui.ActionRow(*buttons)
+
+
+async def _build_toprec_container(
+    period_key: str,
+) -> list[disnake.ui.Container]:
+    label, _ = _toprec_period_meta(period_key)
+    rows = await _load_toprec_rows(period_key)
+
+    children: list = [
+        disnake.ui.TextDisplay(
+            f"## {e('LOGS')}Топ рекрутеров\n"
+            "Сколько заявок каждый модератор принял за выбранный период."
+        ),
+        disnake.ui.Separator(
+            divider=True, spacing=disnake.SeparatorSpacing.small
+        ),
+        disnake.ui.TextDisplay(
+            f"### {label}\n{_format_toprec_rows(rows)}"
+        ),
+        disnake.ui.Separator(
+            divider=True, spacing=disnake.SeparatorSpacing.small
+        ),
+        _build_toprec_buttons(period_key),
+    ]
+    return [
+        disnake.ui.Container(
+            *children, accent_colour=disnake.Colour(SKY_BLUE)
+        )
+    ]
+
+
+# ==========================================
 # МОДАЛКИ ЗАЯВКИ / ПРИНЯТИЯ / ОТКЛОНЕНИЯ
 # ==========================================
 class ApplicationModal(disnake.ui.Modal):
     def __init__(self):
         components = [
             disnake.ui.TextInput(
-                label="Ник в игре, Ваш возраст",
-                placeholder="Андрей, 20 лет",
-                custom_id="name_age",
+                label="Ник/Статик/Возраст",
+                placeholder="Андрей, 1488, 20 лет",
+                custom_id="name_static_age",
                 style=disnake.TextInputStyle.short,
-                max_length=50,
+                max_length=80,
             ),
-            disnake.ui.TextInput(
-                label="Ваш статический ID",
-                placeholder="1488",
-                custom_id="static_id",
-                style=disnake.TextInputStyle.short,
-                max_length=20,
+            _file_upload_label(
+                f"Фото персонажей (1–{MAX_APPLICATION_FILES})",
+                required=True,
             ),
             disnake.ui.TextInput(
                 label="Откаты стрельбы гг/mcl/vzz/capt",
@@ -183,6 +616,18 @@ class ApplicationModal(disnake.ui.Modal):
 
     async def callback(self, inter: disnake.ModalInteraction):
         await inter.response.defer(ephemeral=True)
+
+        files, preview = await _resolve_modal_files(inter)
+        if not files:
+            return await inter.followup.send(
+                components=simple_container(
+                    f"{e('REJECT')}Нужно прикрепить хотя бы одно "
+                    "фото персонажа.",
+                    ERROR_COLOR,
+                ),
+                ephemeral=True,
+            )
+
         category = inter.guild.get_channel(
             int(config["CHANNELS"]["APPLICATION_REVIEW"])
         )
@@ -209,49 +654,56 @@ class ApplicationModal(disnake.ui.Modal):
                     mod_role, read_messages=True, send_messages=True
                 )
 
-        desc = "**Новая заявка**\n\n"
-        desc += f"**От:**\n{inter.author.mention}\n\n"
-        desc += f"**Ник и Возраст**\n{inter.text_values['name_age']}\n\n"
-        desc += f"**Статический ID**\n{inter.text_values['static_id']}\n\n"
-        desc += f"**Откаты стрельбы**\n{inter.text_values['reels']}\n\n"
-        desc += f"**История семей**\n{inter.text_values['history']}\n\n"
-        desc += f"**Опыт и онлайн**\n{inter.text_values['online']}"
+        desc_lines = [
+            "**Новая заявка**",
+            "",
+            f"**От:** {inter.author.mention}",
+            f"**Ник/Статик/Возраст:** "
+            f"{inter.text_values['name_static_age']}",
+            f"**Откаты стрельбы:** {inter.text_values['reels']}",
+            f"**История семей:** {inter.text_values['history']}",
+            f"**Опыт и онлайн:** {inter.text_values['online']}",
+            f"-# Прикреплено фото персонажей: **{len(files)}**",
+        ]
 
-        embed = disnake.Embed(description=desc, color=disnake.Color.orange())
+        children: list = [
+            disnake.ui.TextDisplay("\n".join(desc_lines)),
+            disnake.ui.Separator(
+                divider=True, spacing=disnake.SeparatorSpacing.small
+            ),
+        ]
+        children.extend(preview)
+        if preview:
+            children.append(
+                disnake.ui.Separator(
+                    divider=True, spacing=disnake.SeparatorSpacing.small
+                )
+            )
+        children.append(_build_review_buttons(inter.author.id))
 
-        view = disnake.ui.View(timeout=None)
-        view.add_item(
-            disnake.ui.Button(
-                label="Принять",
-                emoji=e_btn("SUCCESS"),
-                style=disnake.ButtonStyle.success,
-                custom_id=f"accept_{inter.author.id}",
+        cont = [
+            disnake.ui.Container(
+                *children, accent_colour=ORANGE_COLOR
             )
-        )
-        view.add_item(
-            disnake.ui.Button(
-                label="Отклонить",
-                emoji=e_btn("REJECT"),
-                style=disnake.ButtonStyle.danger,
-                custom_id=f"reject_{inter.author.id}",
-            )
-        )
-        view.add_item(
-            disnake.ui.Button(
-                label="Обзвон",
-                emoji=e_btn("CALL"),
-                style=disnake.ButtonStyle.secondary,
-                custom_id=f"call_{inter.author.id}",
-            )
-        )
+        ]
 
         mentions = " ".join(
             [f"<@&{r}>" for r in config["ROLES"]["MODERATOR"]]
         )
+        # У v2-сообщений с components нельзя одновременно использовать
+        # content/embed, поэтому пинг ролей идёт отдельным сообщением.
+        try:
+            await ticket_channel.send(
+                content=f"{mentions}\nНовая заявка от {inter.author.mention}",
+                allowed_mentions=disnake.AllowedMentions(
+                    roles=True, users=True
+                ),
+            )
+        except Exception:
+            pass
         msg = await ticket_channel.send(
-            content=f"{mentions}\nНовая заявка от {inter.author.mention}",
-            embed=embed,
-            view=view,
+            components=cont,
+            files=files,
         )
 
         async with aiosqlite.connect("data/database.sqlite") as db:
@@ -388,19 +840,112 @@ class AcceptModal(disnake.ui.Modal):
                     (str(self.target_user_id),),
                 )
 
+            accepted_at_iso = datetime.datetime.utcnow().isoformat(
+                timespec="seconds"
+            )
             await db.execute(
-                "UPDATE applications SET status = ? WHERE message_id = ?",
-                ("accepted", self.message_id),
+                "UPDATE applications SET status = ?, recruiter_id = ?, "
+                "accepted_at = ? WHERE message_id = ?",
+                (
+                    "accepted",
+                    str(inter.author.id),
+                    accepted_at_iso,
+                    self.message_id,
+                ),
             )
             await db.commit()
 
-        app_embed = None
+        app_text = ""
+        app_msg = None
         try:
-            msg = await inter.channel.fetch_message(int(self.message_id))
-            if msg.embeds:
-                app_embed = msg.embeds[0]
+            app_msg = await inter.channel.fetch_message(int(self.message_id))
+            app_text = _extract_application_text(app_msg)
         except Exception:
             pass
+
+        # Объявление о принятии в канал семьи: тихий пинг + первая строка
+        # анкеты + скриншоты кандидата из исходной заявки.
+        welcome_channel_id = int(
+            config.get("CHANNELS", {}).get(
+                "FAMILY_WELCOME_CHANNEL", 1503157600857100359
+            )
+        )
+        welcome_channel = inter.bot.get_channel(welcome_channel_id)
+        if not welcome_channel:
+            try:
+                welcome_channel = await inter.bot.fetch_channel(
+                    welcome_channel_id
+                )
+            except Exception:
+                welcome_channel = None
+
+        if welcome_channel:
+            from_line = ""
+            nick_static_age_line = ""
+            if app_text:
+                for ln in app_text.splitlines():
+                    stripped = ln.strip()
+                    if not stripped:
+                        continue
+                    if stripped.startswith("**От:**"):
+                        from_line = stripped
+                    elif stripped.startswith("**Ник/Статик/Возраст:**"):
+                        nick_static_age_line = stripped
+            if not from_line:
+                from_line = f"**От:** <@{self.target_user_id}>"
+            welcome_text = from_line
+            if nick_static_age_line:
+                welcome_text += "\n" + nick_static_age_line
+            welcome_text += f"\n**Принял:** {inter.author.mention}"
+
+            screenshot_urls: list[str] = []
+            if app_msg is not None:
+                screenshot_urls = _extract_media_urls(app_msg)
+
+            # 1) Тихий пинг отдельным сообщением (silent=True — без push-
+            #    уведомления, но @ остаётся как ссылка-меншн).
+            try:
+                await welcome_channel.send(
+                    content=f"<@{self.target_user_id}>",
+                    allowed_mentions=disnake.AllowedMentions(
+                        users=True, roles=False, everyone=False
+                    ),
+                    flags=disnake.MessageFlags(
+                        suppress_notifications=True
+                    ),
+                )
+            except Exception:
+                pass
+
+            # 2) V2 Container со скриншотами и блоком «От / Ник-Статик-
+            #    Возраст / Принял».
+            body_children: list = []
+            if welcome_text:
+                body_children.append(disnake.ui.TextDisplay(welcome_text))
+            if screenshot_urls:
+                body_children.append(
+                    disnake.ui.MediaGallery(
+                        *[
+                            disnake.MediaGalleryItem(u)
+                            for u in screenshot_urls
+                        ]
+                    )
+                )
+            if body_children:
+                body_cont = [
+                    disnake.ui.Container(
+                        *body_children, accent_colour=SUCCESS_COLOR
+                    )
+                ]
+                try:
+                    await welcome_channel.send(
+                        components=body_cont,
+                        flags=disnake.MessageFlags(
+                            suppress_notifications=True
+                        ),
+                    )
+                except Exception:
+                    pass
 
         global_logs_channel_id = int(
             config.get("CHANNELS", {}).get(
@@ -461,9 +1006,9 @@ class AcceptModal(disnake.ui.Modal):
                 name="Зашел на сервер", value=join_date, inline=True
             )
 
-            if app_embed and app_embed.description:
+            if app_text:
                 global_embed.description = (
-                    f"**Анкета кандидата:**\n\n{app_embed.description}"
+                    f"**Анкета кандидата:**\n\n{app_text}"
                 )
 
             await global_channel.send(embed=global_embed)
@@ -542,11 +1087,10 @@ class RejectModal(disnake.ui.Modal):
             )
             await db.commit()
 
-        app_embed = None
+        app_text = ""
         try:
             msg = await inter.channel.fetch_message(int(self.message_id))
-            if msg.embeds:
-                app_embed = msg.embeds[0]
+            app_text = _extract_application_text(msg)
         except Exception:
             pass
 
@@ -648,9 +1192,9 @@ class RejectModal(disnake.ui.Modal):
                 name="Зашел на сервер", value=join_date, inline=True
             )
 
-            if app_embed and app_embed.description:
+            if app_text:
                 global_embed.description = (
-                    f"**Анкета кандидата:**\n\n{app_embed.description}"
+                    f"**Анкета кандидата:**\n\n{app_text}"
                 )
 
             await global_channel.send(embed=global_embed)
@@ -680,6 +1224,15 @@ class ApplicationsCog(commands.Cog):
                 "CREATE TABLE IF NOT EXISTS user_coins "
                 "(user_id TEXT PRIMARY KEY, balance INTEGER DEFAULT 0)"
             )
+            # Лёгкая миграция: добавляем колонки для статистики рекрутеров.
+            for column_sql in (
+                "ALTER TABLE applications ADD COLUMN recruiter_id TEXT",
+                "ALTER TABLE applications ADD COLUMN accepted_at TEXT",
+            ):
+                try:
+                    await db.execute(column_sql)
+                except Exception:
+                    pass
             await db.commit()
 
     @commands.Cog.listener()
@@ -687,26 +1240,64 @@ class ApplicationsCog(commands.Cog):
         """Обработчик встроенного селекта в Components V2 панели."""
         if inter.component.custom_id != APPLICATION_SELECT_CID:
             return
+
+        # Если значение не из ожидаемых — просто сбрасываем селект и выходим.
         if not inter.values or inter.values[0] != APPLICATION_OPTION_CREATE:
+            try:
+                await inter.message.edit(components=build_application_panel())
+            except Exception:
+                pass
             return
 
         category = inter.guild.get_channel(
             int(config["CHANNELS"]["APPLICATION_REVIEW"])
         )
+        already_open: disnake.TextChannel | None = None
         if category and isinstance(category, disnake.CategoryChannel):
             for ch in category.text_channels:
                 if str(inter.author.id) in (ch.topic or ""):
-                    return await inter.response.send_message(
-                        f"У вас уже открыта заявка: {ch.mention}",
-                        ephemeral=True,
-                    )
+                    already_open = ch
+                    break
 
-        await inter.response.send_modal(ApplicationModal())
+        if already_open is not None:
+            await inter.response.send_message(
+                f"У вас уже открыта заявка: {already_open.mention}",
+                ephemeral=True,
+            )
+        else:
+            await inter.response.send_modal(ApplicationModal())
+
+        # После любого клика по селекту всегда сбрасываем его состояние,
+        # чтобы кнопка снова была «чистой» и пользователь мог выбрать пункт
+        # повторно без обновления страницы.
+        try:
+            await inter.message.edit(components=build_application_panel())
+        except Exception:
+            pass
 
     @commands.Cog.listener()
     async def on_button_click(self, inter: disnake.MessageInteraction):
         custom_id = inter.component.custom_id
         if not custom_id:
+            return
+
+        if custom_id.startswith(TOPREC_BUTTON_PREFIX):
+            if not inter.author.guild_permissions.administrator:
+                return await inter.response.send_message(
+                    f"{e('REJECT')}Панель доступна только администраторам.",
+                    ephemeral=True,
+                )
+            period_key = custom_id[len(TOPREC_BUTTON_PREFIX):]
+            if period_key not in {k for k, _, _ in TOPREC_PERIODS}:
+                period_key = TOPREC_DEFAULT_PERIOD
+            cont = await _build_toprec_container(period_key)
+            try:
+                await inter.response.edit_message(components=cont)
+            except Exception:
+                try:
+                    await inter.message.edit(components=cont)
+                except Exception:
+                    pass
             return
 
         if custom_id.startswith(("accept_", "reject_", "call_")):
@@ -773,29 +1364,70 @@ class ApplicationsCog(commands.Cog):
 
             try:
                 msg = await inter.channel.fetch_message(int(message_id))
-                embed = msg.embeds[0]
-                embed.color = disnake.Color.orange()
-                embed.set_footer(
-                    text=f"Переведено на обзвон: {inter.author.display_name}"
-                )
-                view = disnake.ui.View(timeout=None)
-                view.add_item(
-                    disnake.ui.Button(
-                        label="Принять",
-                        emoji=e_btn("SUCCESS"),
-                        style=disnake.ButtonStyle.success,
-                        custom_id=f"accept_{user_id}",
+                if msg.components:
+                    ui_container = _to_ui_container(msg.components[0])
+                    new_children: list = []
+                    replaced = False
+                    for child in list(
+                        getattr(ui_container, "children", []) or []
+                    ):
+                        if not replaced and type(child).__name__ == "ActionRow":
+                            new_children.append(
+                                disnake.ui.ActionRow(
+                                    disnake.ui.Button(
+                                        label="Принять",
+                                        emoji=e_btn("SUCCESS"),
+                                        style=disnake.ButtonStyle.success,
+                                        custom_id=f"accept_{user_id}",
+                                    ),
+                                    disnake.ui.Button(
+                                        label="Отклонить",
+                                        emoji=e_btn("REJECT"),
+                                        style=disnake.ButtonStyle.danger,
+                                        custom_id=f"reject_{user_id}",
+                                    ),
+                                )
+                            )
+                            replaced = True
+                        else:
+                            new_children.append(child)
+                    new_children.append(
+                        disnake.ui.TextDisplay(
+                            f"-# Переведено на обзвон: "
+                            f"{inter.author.display_name}"
+                        )
                     )
-                )
-                view.add_item(
-                    disnake.ui.Button(
-                        label="Отклонить",
-                        emoji=e_btn("REJECT"),
-                        style=disnake.ButtonStyle.danger,
-                        custom_id=f"reject_{user_id}",
+                    new_cont = [
+                        disnake.ui.Container(
+                            *new_children, accent_colour=ORANGE_COLOR
+                        )
+                    ]
+                    await msg.edit(components=new_cont)
+                elif msg.embeds:
+                    embed = msg.embeds[0]
+                    embed.color = disnake.Color.orange()
+                    embed.set_footer(
+                        text=f"Переведено на обзвон: "
+                        f"{inter.author.display_name}"
                     )
-                )
-                await msg.edit(embed=embed, view=view)
+                    view = disnake.ui.View(timeout=None)
+                    view.add_item(
+                        disnake.ui.Button(
+                            label="Принять",
+                            emoji=e_btn("SUCCESS"),
+                            style=disnake.ButtonStyle.success,
+                            custom_id=f"accept_{user_id}",
+                        )
+                    )
+                    view.add_item(
+                        disnake.ui.Button(
+                            label="Отклонить",
+                            emoji=e_btn("REJECT"),
+                            style=disnake.ButtonStyle.danger,
+                            custom_id=f"reject_{user_id}",
+                        )
+                    )
+                    await msg.edit(embed=embed, view=view)
             except Exception:
                 pass
 
@@ -891,6 +1523,30 @@ class ApplicationsCog(commands.Cog):
             await ctx.message.delete()
         except Exception:
             pass
+
+    @commands.command(name="toprec")
+    @commands.has_permissions(administrator=True)
+    async def toprec(self, ctx: commands.Context):
+        """Топ рекрутеров: один период с переключением кнопками (админ-only)."""
+        cont = await _build_toprec_container(TOPREC_DEFAULT_PERIOD)
+        await ctx.send(
+            components=cont,
+            allowed_mentions=disnake.AllowedMentions.none(),
+        )
+
+    @toprec.error
+    async def toprec_error(
+        self, ctx: commands.Context, error: commands.CommandError
+    ):
+        if isinstance(error, commands.MissingPermissions):
+            try:
+                await ctx.reply(
+                    f"{e('REJECT')}Команда доступна только администраторам.",
+                    mention_author=False,
+                    delete_after=10,
+                )
+            except Exception:
+                pass
 
 
 def setup(bot):
