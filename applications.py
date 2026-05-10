@@ -759,16 +759,23 @@ class AcceptModal(disnake.ui.Modal):
                 welcome_channel = None
 
         if welcome_channel:
-            first_line = ""
+            from_line = ""
+            nick_static_age_line = ""
             if app_text:
                 for ln in app_text.splitlines():
                     stripped = ln.strip()
                     if not stripped:
                         continue
-                    if "Новая заявка" in stripped:
-                        continue
-                    first_line = stripped
-                    break
+                    if stripped.startswith("**От:**"):
+                        from_line = stripped
+                    elif stripped.startswith("**Ник/Статик/Возраст:**"):
+                        nick_static_age_line = stripped
+            if not from_line:
+                from_line = f"**От:** <@{self.target_user_id}>"
+            welcome_text = from_line
+            if nick_static_age_line:
+                welcome_text += "\n" + nick_static_age_line
+            welcome_text += f"\n**Принял:** {inter.author.mention}"
 
             screenshot_urls: list[str] = []
             if app_msg is not None:
@@ -789,10 +796,11 @@ class AcceptModal(disnake.ui.Modal):
             except Exception:
                 pass
 
-            # 2) V2 Container со скриншотами и первой строкой анкеты.
+            # 2) V2 Container со скриншотами и блоком «От / Ник-Статик-
+            #    Возраст / Принял».
             body_children: list = []
-            if first_line:
-                body_children.append(disnake.ui.TextDisplay(first_line))
+            if welcome_text:
+                body_children.append(disnake.ui.TextDisplay(welcome_text))
             if screenshot_urls:
                 body_children.append(
                     disnake.ui.MediaGallery(
