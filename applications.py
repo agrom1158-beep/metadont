@@ -728,9 +728,18 @@ class AcceptModal(disnake.ui.Modal):
                     (str(self.target_user_id),),
                 )
 
+            accepted_at_iso = datetime.datetime.utcnow().isoformat(
+                timespec="seconds"
+            )
             await db.execute(
-                "UPDATE applications SET status = ? WHERE message_id = ?",
-                ("accepted", self.message_id),
+                "UPDATE applications SET status = ?, recruiter_id = ?, "
+                "accepted_at = ? WHERE message_id = ?",
+                (
+                    "accepted",
+                    str(inter.author.id),
+                    accepted_at_iso,
+                    self.message_id,
+                ),
             )
             await db.commit()
 
@@ -1103,6 +1112,15 @@ class ApplicationsCog(commands.Cog):
                 "CREATE TABLE IF NOT EXISTS user_coins "
                 "(user_id TEXT PRIMARY KEY, balance INTEGER DEFAULT 0)"
             )
+            # Лёгкая миграция: добавляем колонки для статистики рекрутеров.
+            for column_sql in (
+                "ALTER TABLE applications ADD COLUMN recruiter_id TEXT",
+                "ALTER TABLE applications ADD COLUMN accepted_at TEXT",
+            ):
+                try:
+                    await db.execute(column_sql)
+                except Exception:
+                    pass
             await db.commit()
 
     @commands.Cog.listener()
@@ -1374,6 +1392,88 @@ class ApplicationsCog(commands.Cog):
             await ctx.message.delete()
         except Exception:
             pass
+
+    @commands.command(name="toprec")
+    async def toprec(self, ctx: commands.Context):
+        """Топ рекрутеров по числу принятых заявок (день/неделя/месяц/полгода/всё время)."""
+        now = datetime.datetime.utcnow()
+        periods: list[tuple[str, datetime.datetime | None]] = [
+            ("За день", now - datetime.timedelta(days=1)),
+            ("За неделю", now - datetime.timedelta(days=7)),
+            ("За месяц", now - datetime.timedelta(days=30)),
+            ("За полгода", now - datetime.timedelta(days=182)),
+            ("За всё время", None),
+        ]
+
+        async def _top_for(
+            db, since: datetime.datetime | None, limit: int = 10
+        ) -> list[tuple[str, int]]:
+            if since is None:
+                sql = (
+                    "SELECT recruiter_id, COUNT(*) AS cnt FROM applications "
+                    "WHERE status = 'accepted' AND recruiter_id IS NOT NULL "
+                    "GROUP BY recruiter_id ORDER BY cnt DESC LIMIT ?"
+                )
+                params: tuple = (limit,)
+            else:
+                sql = (
+                    "SELECT recruiter_id, COUNT(*) AS cnt FROM applications "
+                    "WHERE status = 'accepted' AND recruiter_id IS NOT NULL "
+                    "AND accepted_at IS NOT NULL AND accepted_at >= ? "
+                    "GROUP BY recruiter_id ORDER BY cnt DESC LIMIT ?"
+                )
+                params = (since.isoformat(timespec="seconds"), limit)
+            rows: list[tuple[str, int]] = []
+            async with db.execute(sql, params) as cur:
+                async for r in cur:
+                    rows.append((str(r[0]), int(r[1])))
+            return rows
+
+        async with aiosqlite.connect("data/database.sqlite") as db:
+            results = []
+            for title, since in periods:
+                results.append((title, await _top_for(db, since)))
+
+        def _fmt_rows(rows: list[tuple[str, int]]) -> str:
+            if not rows:
+                return "-# Нет принятых заявок за этот период"
+            medals = ("🥇", "🥈", "🥉")
+            lines = []
+            for i, (uid, cnt) in enumerate(rows):
+                prefix = medals[i] if i < len(medals) else f"`{i + 1:>2}.`"
+                lines.append(f"{prefix} <@{uid}> — **{cnt}**")
+            return "\n".join(lines)
+
+        children: list = [
+            disnake.ui.TextDisplay(
+                f"## {e('LOGS')}Топ рекрутеров\n"
+                "Сколько заявок каждый модератор принял за разные периоды."
+            ),
+            disnake.ui.Separator(
+                divider=True, spacing=disnake.SeparatorSpacing.small
+            ),
+        ]
+        for idx, (title, rows) in enumerate(results):
+            children.append(
+                disnake.ui.TextDisplay(f"### {title}\n{_fmt_rows(rows)}")
+            )
+            if idx < len(results) - 1:
+                children.append(
+                    disnake.ui.Separator(
+                        divider=True,
+                        spacing=disnake.SeparatorSpacing.small,
+                    )
+                )
+
+        cont = [
+            disnake.ui.Container(
+                *children, accent_colour=disnake.Colour(SKY_BLUE)
+            )
+        ]
+        await ctx.send(
+            components=cont,
+            allowed_mentions=disnake.AllowedMentions.none(),
+        )
 
 
 def setup(bot):
