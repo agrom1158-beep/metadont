@@ -689,11 +689,91 @@ class AcceptModal(disnake.ui.Modal):
             await db.commit()
 
         app_text = ""
+        app_msg = None
         try:
-            msg = await inter.channel.fetch_message(int(self.message_id))
-            app_text = _extract_application_text(msg)
+            app_msg = await inter.channel.fetch_message(int(self.message_id))
+            app_text = _extract_application_text(app_msg)
         except Exception:
             pass
+
+        # Объявление о принятии в канал семьи: тихий пинг + первая строка
+        # анкеты + скриншоты кандидата из исходной заявки.
+        welcome_channel_id = int(
+            config.get("CHANNELS", {}).get(
+                "FAMILY_WELCOME_CHANNEL", 1503157600857100359
+            )
+        )
+        welcome_channel = inter.bot.get_channel(welcome_channel_id)
+        if not welcome_channel:
+            try:
+                welcome_channel = await inter.bot.fetch_channel(
+                    welcome_channel_id
+                )
+            except Exception:
+                welcome_channel = None
+
+        if welcome_channel:
+            first_line = ""
+            if app_text:
+                for ln in app_text.splitlines():
+                    stripped = ln.strip()
+                    if not stripped:
+                        continue
+                    if "Новая заявка" in stripped:
+                        continue
+                    first_line = stripped
+                    break
+
+            screenshot_urls: list[str] = []
+            if app_msg is not None:
+                screenshot_urls = [
+                    a.url
+                    for a in (getattr(app_msg, "attachments", None) or [])
+                ]
+
+            # 1) Тихий пинг отдельным сообщением (silent=True — без push-
+            #    уведомления, но @ остаётся как ссылка-меншн).
+            try:
+                await welcome_channel.send(
+                    content=f"<@{self.target_user_id}>",
+                    allowed_mentions=disnake.AllowedMentions(
+                        users=True, roles=False, everyone=False
+                    ),
+                    flags=disnake.MessageFlags(
+                        suppress_notifications=True
+                    ),
+                )
+            except Exception:
+                pass
+
+            # 2) V2 Container со скриншотами и первой строкой анкеты.
+            body_children: list = []
+            if first_line:
+                body_children.append(disnake.ui.TextDisplay(first_line))
+            if screenshot_urls:
+                body_children.append(
+                    disnake.ui.MediaGallery(
+                        *[
+                            disnake.MediaGalleryItem(u)
+                            for u in screenshot_urls
+                        ]
+                    )
+                )
+            if body_children:
+                body_cont = [
+                    disnake.ui.Container(
+                        *body_children, accent_colour=SUCCESS_COLOR
+                    )
+                ]
+                try:
+                    await welcome_channel.send(
+                        components=body_cont,
+                        flags=disnake.MessageFlags(
+                            suppress_notifications=True
+                        ),
+                    )
+                except Exception:
+                    pass
 
         global_logs_channel_id = int(
             config.get("CHANNELS", {}).get(
